@@ -1,0 +1,587 @@
+{
+    "OnRobot_2FG14_custom":{
+        "gripper_name":"OnRobot_2FG14_custom",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/OnRobot_2FG14_custom/OnRobot_2FG14_custom.usd",
+        "type": "finger2",
+        "width" : 0.11,
+        "height":0.026,
+        "depth" :0.10,
+        "finger_thickness" : 0.006,
+        "close_r_joint":-0.045,
+        "close_l_joint":0.045,
+        "open_r_joint": 0.03,
+        "open_l_joint":-0.03,
+        "down_lift_joint":-0.894,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.5,
+            "right_joint": 0.0,
+            "left_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":1000.0,
+                "damping":130.0
+            },
+            "right_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            },
+            "left_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            }
+        }
+    },
+    
+    "Schunk_PGB_custom":{
+        "gripper_name":"Schunk_PGB_custom",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/Schunk_PGB_custom/Schunk_PGB_custom.usd",
+        "type": "finger2",
+        "width" : 0.16,
+        "height":0.018,
+        "depth" :0.15,
+        "finger_thickness" : 0.056,
+        "close_r_joint":0.00001,
+        "close_l_joint":-0.00001,
+        "open_r_joint":-0.08,
+        "open_l_joint":0.08,
+        "down_lift_joint":-0.848,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.5,
+            "right_joint": 0.0,
+            "left_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":1000.0,
+                "damping":130.0
+            },
+            "right_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            },
+            "left_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            }
+        }
+    },
+    "Zimmer_Electric_GEP2016IO_custom":{
+        "gripper_name":"Zimmer_Electric_GEP2016IO_custom",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/Zimmer_Electric_GEP2016IO_custom/Zimmer_Electric_GEP2016IO_custom.usd",
+        "type": "finger2",
+        "width" : 0.16,
+        "height":0.014,
+        "depth" :0.14,
+        "finger_thickness" : 0.03,
+        "close_r_joint":-0.00001,
+        "close_l_joint":0.00001,
+        "open_r_joint":0.08,
+        "open_l_joint":-0.08,
+        "down_lift_joint":-0.85,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.5,
+            "right_joint": 0.0,
+            "left_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":1000.0,
+                "damping":130.0
+            },
+            "right_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            },
+            "left_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            }
+        }
+    },
+    "UON_Robotics_Jamin_Gripper":{
+        "gripper_name":"UON_Robotics_Jamin_Gripper",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/UON_Robotics_Jamin_Gripper/UON_Robotics_Jamin_Gripper.usd",
+        "type": "finger2",
+        "width" : 0.14,
+        "height":0.034,
+        "depth" :0.1224,
+        "finger_thickness" : 0.01,
+        "close_r_joint":0.035,
+        "close_l_joint":0.035,
+        "open_r_joint":-0.035,
+        "open_l_joint":-0.035,
+        "down_lift_joint":-0.982,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.5,
+            "right_joint": 0.0,
+            "left_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":1000.0,
+                "damping":130.0
+            },
+            "right_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            },
+            "left_joint":{
+                "effort_limit":50.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":150.0
+            }
+        }
+    },
+    "Hitbot_z_efg_100":{
+        "gripper_name":"Hitbot_z_efg_100",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/Hitbot_z_efg_100/Hitbot_z_efg_100.usd",
+        "type": "finger2_parallel",
+        "width" : 0.13,
+        "height":0.018,
+        "depth" :0.06,
+        "finger_thickness" : 0.008,
+        "finger_joint_thickness" : 0.0065,
+        "close_r_joint":-48,
+        "close_l_joint":-48,
+        "close_rf_joint":48,
+        "close_lf_joint":48,
+        "zero_deg_r_joint":-45,
+        "zero_deg_l_joint":-45,
+        "outer_link_length":0.0654,
+        "outer_link_offset":0.01,
+        "down_lift_joint":-1.212,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.5,
+            "right_joint": 0.0,
+            "left_joint": 0.0,
+            "right_finger_joint":0.0,
+            "left_finger_joint":0.0,
+            "z_hop_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":230.0
+            },
+            "right_joint":{
+                "effort_limit":300.0,
+                "velocity_limit":"None",
+                "stiffness": 5000.0,
+                "damping":300.0
+            },
+            "left_joint":{
+                "effort_limit":300.0,
+                "velocity_limit":"None",
+                "stiffness":5000.0,
+                "damping":300.0
+            },
+            "right_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "left_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "z_hop_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0
+            }
+        }
+    },
+    "OnRobot_RG2FTv2":{
+        "gripper_name":"OnRobot_RG2FTv2",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/OnRobot_RG2FTv2/OnRobot_RG2FTv2.usd",
+        "type": "finger2_parallel",
+        "width" : 0.1,
+        "height":0.03,
+        "depth" :0.05,
+        "finger_thickness" : 0.019,
+        "finger_joint_thickness" : 0.0097,
+        "close_r_joint": -44,
+        "close_l_joint":  44,
+        "close_rf_joint": 24,
+        "close_lf_joint":-24,
+        "zero_deg_r_joint": -46.2,
+        "zero_deg_l_joint":  46.2,
+        "outer_link_length":0.055,
+        "outer_link_offset":0.00745,
+        "down_lift_joint":-0.988,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.55,
+            "right_joint": 0.0,
+            "left_joint": 0.0,
+            "right_finger_joint":0.0,
+            "left_finger_joint":0.0,
+            "z_hop_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":230.0
+            },
+            "right_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "left_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "right_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "left_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "z_hop_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0
+            }
+        }
+    },
+    "OnRobot_RG6_v1_2":{
+        "gripper_name":"OnRobot_RG6_v1_2",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/OnRobot_RG6_v1_2/OnRobot_RG6_v1_2.usd",
+        "type": "finger2_parallel",
+        "width" : 0.146,
+        "height":0.025,
+        "depth" :0.06,
+        "finger_thickness" : 0.0134,
+        "finger_joint_thickness" : 0.0113,
+        "close_r_joint": 36,
+        "close_l_joint":-36,
+        "close_rf_joint":-36,
+        "close_lf_joint":36,
+        "zero_deg_r_joint":  36,
+        "zero_deg_l_joint": -36,
+        "outer_link_length":0.08,
+        "outer_link_offset":0.0106,
+        "down_lift_joint":-1.044,
+        "yaw_max":180,
+        "init_joint_pos":{
+            "lift_joint": -0.55,
+            "right_joint": 0.0,
+            "left_joint": 0.0,
+            "right_finger_joint":0.0,
+            "left_finger_joint":0.0,
+            "z_hop_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":230.0
+            },
+            "right_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "left_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "right_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "left_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "z_hop_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0
+            }
+        }
+    },
+    "DH_Robotics_DH3":{
+        "gripper_name":"DH_Robotics_DH3",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/DH_Robotics_DH3/DH_Robotics_DH3.usd",
+        "type": "finger3_parallel",
+        "width" : 0.1242,
+        "height":0.02,
+        "depth" :0.06,
+        "finger_thickness" : 0.012,
+        "finger_joint_thickness" : 0.0072,
+        "close_f0_joint": -65,
+        "close_f1_joint": -65,
+        "close_f2_joint":  65,
+        "zero_deg_f0_joint": -53,
+        "zero_deg_f1_joint": -53,
+        "zero_deg_f2_joint":  53,
+        "outer_link_length":0.0551,
+        "outer_link_offset":0.02414,
+        "down_lift_joint":-1.023,
+        "yaw_max":120,
+        "finger_bbox_info":[
+            {"pos":[0,0],"rot": 0 },
+            {"pos":[0,0],"rot": 120 },
+            {"pos":[0,0],"rot": 240 }
+        ],
+        "init_joint_pos":{
+            "lift_joint": -0.55,
+            "f0_joint":0.0,
+            "f1_joint":0.0,
+            "f2_joint":0.0,
+            "f0_finger_joint":0.0,
+            "f1_finger_joint":0.0,
+            "f2_finger_joint":0.0,
+            "z_hop_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":230.0
+            },
+            "f0_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f1_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f2_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f0_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "f1_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "f2_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "z_hop_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0
+            }
+        }
+    },
+    "Robotiq_3Finger_Adaptive_Gripper":{
+        "gripper_name":"Robotiq_3Finger_Adaptive_Gripper",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/Robotiq_3Finger_Adaptive_Gripper/Robotiq_3Finger_Adaptive_Gripper.usd",
+        "type": "finger3_parallel",
+        "width" : 0.2, 
+        "height":0.03,
+        "depth" :0.09,
+        "finger_thickness" : 0.025,
+        "finger_joint_thickness" : 0.007,
+        "close_f0_joint":  23,
+        "close_f1_joint":  23,
+        "close_f2_joint":  23,
+        "zero_deg_f0_joint": 0,
+        "zero_deg_f1_joint": 0,
+        "zero_deg_f2_joint": 0,
+        "outer_link_length":0.095,
+        "outer_link_offset":0.0444,
+        "down_lift_joint":-1.063,
+        "yaw_max":360,
+        "finger_bbox_info":[
+            {"pos":[0,0],"rot": 0},
+            {"pos":[-0.0365,0],"rot": 180},
+            {"pos":[0.0365,0],"rot": 180}
+        ],
+        "init_joint_pos":{
+            "lift_joint": -0.55,
+            "f0_joint":0.0,
+            "f1_joint":0.0,
+            "f2_joint":0.0,
+            "z_hop_joint": 0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":230.0
+            },
+            "f0_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f1_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f2_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f0_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "f1_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "f2_finger_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0.0
+            },
+            "z_hop_joint":{
+                "effort_limit":2000000.0,
+                "velocity_limit":"None",
+                "stiffness":200000000.0,
+                "damping":0
+            }
+        }
+    },
+    "Schunk_SGW64":{
+        "gripper_name":"Schunk_SGW64",
+        "usd_path" :"/nas/ochansol/isaac/sanjabu/Robot/Schunk_SGW64/Schunk_SGW64.usd",
+        "type": "finger3",
+        "width" : 0.0886,
+        "height":0.012,
+        "depth" :0.067,
+        "finger_thickness" : 0.009,
+        "finger_joint_thickness" : 0.0,
+        "close_f0_joint": 18,
+        "close_f1_joint": 18,
+        "close_f2_joint": 18,
+        "zero_deg_f0_joint": 0,
+        "zero_deg_f1_joint": 0,
+        "zero_deg_f2_joint": 0,
+        "outer_link_length":0.0738,
+        "outer_link_offset":0.0257,
+        "down_lift_joint":-0.98,
+        "yaw_max":120,
+        "finger_bbox_info":[
+            {"pos":[0,0],"rot": 0 },
+            {"pos":[0,0],"rot": 120 },
+            {"pos":[0,0],"rot": 240 }
+        ],
+        "init_joint_pos":{
+            "lift_joint": -0.55,
+            "f0_joint":0.0,
+            "f1_joint":0.0,
+            "f2_joint":0.0
+        },
+        "joint_cfg":{
+            "lift_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":2000.0,
+                "damping":230.0
+            },
+            "f0_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f1_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            },
+            "f2_joint":{
+                "effort_limit":200.0,
+                "velocity_limit":"None",
+                "stiffness":3000.0,
+                "damping":250.0
+            }
+        }
+    }
+}
+
+
