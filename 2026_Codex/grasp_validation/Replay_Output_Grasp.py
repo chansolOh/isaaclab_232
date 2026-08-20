@@ -27,6 +27,7 @@ LEGACY_CHANSOL_DIR = CODEX_DIR.parent / "chansol"
 HEADLESS = False
 REPLAY_RESET_DELAY_SEC = 0.35
 CONTROL_POLL_SEC = 0.10
+PRINT_HAND_CONTACT_SEPARATION = True
 
 if str(CODEX_DIR) not in sys.path:
     sys.path.insert(0, str(CODEX_DIR))
@@ -307,6 +308,10 @@ def main() -> None:
         import torch
 
         import Direct_RL_main_new_filter as grasp_main
+        from codex_cfgs.grasp_physics_settings import (
+            configure_scene_object_rigid_props,
+            make_grasp_simulation_cfg,
+        )
         from cfgs.scene_cfg import platform_setup, scene_obj_setup
 
         conf_path = root_path / "conf" / f"{scene_num:04d}.json"
@@ -324,9 +329,12 @@ def main() -> None:
         if is_hand:
             import codex_cfgs.Robot_EnvCfg_hand_platform_filter as robot_module
         else:
-            import cfgs.Robot_EnvCfg as robot_module
+            import codex_cfgs.Robot_EnvCfg_finger_platform_filter as robot_module
 
         env_cfg = robot_module.RobotEnvCfg()
+        # Load to Sim must use the exact same shared PhysicsScene settings as
+        # output-grasp collection instead of maintaining replay-only values.
+        env_cfg.sim = make_grasp_simulation_cfg()
         env_cfg.envs = 1
         env_cfg.scene.num_envs = 1
         if is_hand:
@@ -335,8 +343,18 @@ def main() -> None:
             robot_module.Set_RobotEnvCFG(env_cfg, gripper_info)
 
         scene_obj_setup(env_cfg.scene, conf_data["objects"])
+        # Apply the shared GPU-safe rigid-body limits after the scene entries
+        # have been populated, so replay and collection handle contacts alike.
+        configure_scene_object_rigid_props(env_cfg.scene)
         platform_setup(env_cfg.scene, conf_data["platform"])
         grasp_main._object_frame_transformer_setup_with_asset_names(env_cfg.scene, conf_data["objects"])
+        if is_hand:
+            # Detailed separation data needs the same hand-object contact
+            # filters used by output-grasp collection.
+            grasp_main._configure_hand_contact_separation_filters(
+                env_cfg.scene, conf_data["objects"]
+            )
+            env_cfg.print_contact_separation = PRINT_HAND_CONTACT_SEPARATION
 
         env = robot_module.RobotEnv(
             cfg=env_cfg,

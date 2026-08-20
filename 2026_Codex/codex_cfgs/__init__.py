@@ -1,1 +1,1 @@
-"""Codex-authored hand gripper environment modules."""
+"""2026 hand and calibrated finger-gripper environment modules."""

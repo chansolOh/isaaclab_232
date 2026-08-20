@@ -28,7 +28,7 @@ from typing import Iterable, Sequence
 import numpy as np
 
 
-DEFAULT_HAND_INFO_PATH = "/nas/ochansol/gripper_info/gripper_info_hand.json"
+DEFAULT_HAND_INFO_PATH = "/nas/ochansol/gripper_info/gripper_info_hand_2026.json"
 DEFAULT_YAWS = tuple(range(0, 360, 10))
 HEIGHT_MAP_ARCHIVE_SCHEMA_VERSION = 3
 
@@ -802,14 +802,33 @@ def target_pose_from_tcp(
     }
 
 
+def target_pose_from_start_correspondence(
+    template_start_pose: dict,
+    template_pose: dict,
+    target_start_pose: dict,
+) -> dict:
+    """Map a template waypoint using the rigid transform START acquired."""
+    template_start = pose_matrix(template_start_pose)
+    template_waypoint = pose_matrix(template_pose)
+    target_start = pose_matrix(target_start_pose)
+    target_waypoint = target_start @ np.linalg.inv(template_start) @ template_waypoint
+    rotation = target_waypoint[:3, :3]
+    return {
+        "frame": "world",
+        "position": target_waypoint[:3, 3].tolist(),
+        "orientation_wxyz": matrix_to_quaternion_wxyz(rotation).tolist(),
+        "rpy_deg": _matrix_to_rpy_degrees(rotation),
+    }
+
+
 def target_base_tf_from_tcp(
     preset: dict,
     target_tcp_world: Sequence[float],
     yaw_deg: float,
 ) -> dict:
-    """Return legacy hand-preset START/END base transforms about the same TCP."""
+    """Return START/VIA/END base transforms about the same target TCP."""
     template_tcp = preset_tcp_world_point(preset)
-    return {
+    result = {
         "start": target_pose_from_tcp(
             preset["start_base_tf"], template_tcp, target_tcp_world, yaw_deg
         ),
@@ -817,6 +836,69 @@ def target_base_tf_from_tcp(
             preset["end_base_tf"], template_tcp, target_tcp_world, yaw_deg
         ),
     }
+    via_base_tf = preset.get("via_base_tf")
+    if isinstance(via_base_tf, dict):
+        result["via"] = target_pose_from_tcp(
+            via_base_tf, template_tcp, target_tcp_world, yaw_deg
+        )
+    return result
+
+
+def preset_contact_sensor_sets(preset: dict) -> dict[str, list[str]]:
+    """Group fingertip rigid-body sensor paths for saved preset metadata.
+
+    Presets saved before ``contact_sensor_path`` was introduced are supported
+    by using the parent link of their selected mesh path.  Missing legacy
+    ``contact_set`` values each receive a distinct set, matching the pre-grasp
+    BBox filter's compatibility rule. The grasp-time lost-contact check treats
+    the resulting active sensor collection as one global OR, independent of
+    these groups.
+    """
+    fingertips = preset.get("fingertip_points", {})
+    if not isinstance(fingertips, dict) or not fingertips:
+        raise ValueError(
+            f"Preset {preset.get('name', '<unnamed>')!r} has no fingertip_points"
+        )
+
+    fingertip_values = [
+        value for value in fingertips.values() if isinstance(value, dict)
+    ]
+    explicit_sets = {
+        value.get("contact_set")
+        for value in fingertip_values
+        if isinstance(value.get("contact_set"), int)
+        and not isinstance(value.get("contact_set"), bool)
+        and value.get("contact_set") >= 1
+    }
+    used_sets = set(explicit_sets)
+    next_set = 1
+    grouped: dict[str, list[str]] = {}
+    for fingertip in fingertip_values:
+        raw_set = fingertip.get("contact_set")
+        if isinstance(raw_set, int) and not isinstance(raw_set, bool) and raw_set >= 1:
+            set_id = raw_set
+        else:
+            while next_set in used_sets:
+                next_set += 1
+            set_id = next_set
+            used_sets.add(set_id)
+            next_set += 1
+
+        sensor_path = fingertip.get("contact_sensor_path")
+        if not isinstance(sensor_path, str) or not sensor_path:
+            mesh_path = fingertip.get("mesh_path")
+            if not isinstance(mesh_path, str) or not mesh_path.startswith("/"):
+                raise ValueError(
+                    f"Preset {preset.get('name', '<unnamed>')!r} has a fingertip "
+                    "without contact_sensor_path or a usable mesh_path"
+                )
+            stripped = mesh_path.rstrip("/")
+            sensor_path = stripped.rsplit("/", 1)[0] if "/" in stripped[1:] else stripped
+
+        group = grouped.setdefault(str(set_id), [])
+        if sensor_path not in group:
+            group.append(sensor_path)
+    return grouped
 
 
 def make_pregrasp_record(
@@ -874,6 +956,7 @@ def make_pregrasp_record(
         },
         "joint_unit": preset.get("joint_unit", "rad"),
         "transition": dict(preset.get("transition", {})),
+        "contact_sensor_sets": preset_contact_sensor_sets(preset),
         "gripper_usd_path": None if gripper is None else gripper.get("usd_path"),
         "selected_heightmap_yaw": selected_yaw,
         "first_contact_z": first_contact_z,

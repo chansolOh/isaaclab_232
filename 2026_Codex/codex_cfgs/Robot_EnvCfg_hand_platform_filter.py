@@ -8,17 +8,26 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import math
+import posixpath
+import re
 
 import torch
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
-from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
 from cfgs import scene_cfg as SC
 from .action_policy_hand_new import HandActionPolicy, _quaternion_slerp
+from .grasp_physics_settings import (
+    ARTICULATION_POSITION_ITERATION_COUNT,
+    ARTICULATION_VELOCITY_ITERATION_COUNT,
+    SIM_DT,
+    configure_scene_object_rigid_props,
+    make_grasp_simulation_cfg,
+)
 
 
 EMPTY_HAND_ENV_CFG = ArticulationCfg(
@@ -32,13 +41,77 @@ EMPTY_HAND_ENV_CFG = ArticulationCfg(
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             fix_root_link=False,
             enabled_self_collisions=False,
-            solver_position_iteration_count=16,
-            solver_velocity_iteration_count=1,
+            solver_position_iteration_count=ARTICULATION_POSITION_ITERATION_COUNT,
+            solver_velocity_iteration_count=ARTICULATION_VELOCITY_ITERATION_COUNT,
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(joint_pos={}),
     actuators={},
 )
+
+
+def _contact_sensor_relative_pattern(gripper_info: dict, pre_grasp_data: list) -> str:
+    """Build one exact ContactSensorCfg pattern for all configured fingertips."""
+    sensor_paths: list[str] = []
+    for record in pre_grasp_data:
+        sensor_sets = record.get("contact_sensor_sets", {})
+        if not isinstance(sensor_sets, dict):
+            continue
+        for paths in sensor_sets.values():
+            if not isinstance(paths, list):
+                continue
+            for path in paths:
+                if isinstance(path, str) and path.startswith("/") and path not in sensor_paths:
+                    sensor_paths.append(path)
+
+    # Always include every contact-reporter body explicitly configured for the
+    # hand, even when a particular preset uses only a subset of fingertips.
+    for path in gripper_info.get("contact_sensor_paths", []):
+        if isinstance(path, str) and path.startswith("/") and path not in sensor_paths:
+            sensor_paths.append(path)
+
+    if not sensor_paths:
+        # Compatibility for an old database before contact_sensor_paths were
+        # persisted. Selected fingertip mesh prims are normally direct children
+        # of their rigid link.
+        for preset in gripper_info.get("preset", []):
+            if not isinstance(preset, dict):
+                continue
+            fingertips = preset.get("fingertip_points", {})
+            if not isinstance(fingertips, dict):
+                continue
+            for fingertip in fingertips.values():
+                if not isinstance(fingertip, dict):
+                    continue
+                mesh_path = fingertip.get("mesh_path")
+                if not isinstance(mesh_path, str) or not mesh_path.startswith("/"):
+                    continue
+                stripped = mesh_path.rstrip("/")
+                path = stripped.rsplit("/", 1)[0] if "/" in stripped[1:] else stripped
+                if path not in sensor_paths:
+                    sensor_paths.append(path)
+
+    if not sensor_paths:
+        # Generic legacy fallback. New presets should always take an exact path.
+        return ".*"
+
+    relative_paths = [path.strip("/") for path in sensor_paths]
+    parent_paths = {posixpath.dirname(path) for path in relative_paths}
+    if len(parent_paths) != 1:
+        raise ValueError(
+            "Configured contact sensor rigid bodies must share one USD parent for "
+            f"Isaac Lab ContactSensorCfg, got: {sensor_paths}"
+        )
+    parent_path = parent_paths.pop()
+    body_names = sorted({posixpath.basename(path) for path in relative_paths})
+    if any(not name for name in body_names):
+        raise ValueError(f"Invalid contact sensor rigid-body paths: {sensor_paths}")
+    body_pattern = (
+        re.escape(body_names[0])
+        if len(body_names) == 1
+        else "(?:" + "|".join(re.escape(name) for name in body_names) + ")"
+    )
+    return f"{parent_path}/{body_pattern}" if parent_path else body_pattern
 
 
 def Set_RobotEnvCFG(envcfg, gripper_info, pre_grasp_data):
@@ -83,10 +156,17 @@ def Set_RobotEnvCFG(envcfg, gripper_info, pre_grasp_data):
     envcfg.robot_cfg.actuators = actuators
     envcfg.joint_names = list(joint_cfg)
     envcfg.gripper_info = gripper_info
+    envcfg.contact_sensor_prim_path = _contact_sensor_relative_pattern(
+        gripper_info, pre_grasp_data
+    )
+    envcfg.scene.contact_sensor.prim_path = (
+        f"{envcfg.robot_prim_path}/{envcfg.contact_sensor_prim_path}"
+    )
     # Do not cap passive/mimic DOFs by default.  PhysX mimic constraints use
     # those DOFs internally, so forcing the same low gripper effort limit onto
     # them can make the hand feel weak when mimic damping is tuned in the USD.
     envcfg.passive_effort_limit = gripper_info.get("passive_effort_limit")
+    configure_scene_object_rigid_props(envcfg.scene)
 
 
 @configclass
@@ -96,36 +176,32 @@ class RobotEnvCfg(DirectRLEnvCfg):
     action_space = 1
     observation_space = 4
     state_space = 0
-    envs = 200
-    dt = 1 / 700
+    envs = 400
+    dt = SIM_DT
 
     robot_prim_path = "/World/envs/env_.*/Robot"
     contact_sensor_prim_path = "right_hand_.*"
     root_max_linear_speed = 0.5
     root_max_angular_speed = math.radians(180.0)
-    z_compliance_force_threshold = 2.0
-    z_compliance_stiffness = 10.0
+    z_compliance_force_threshold = 1.0
+    z_compliance_stiffness = 2.0
     z_compliance_max_offset = 0.1
     z_compliance_spring = 0.0
-    z_compliance_damping = 1.0
+    z_compliance_damping = 0.1
     z_compliance_max_speed = 0.08
     z_compliance_force_filter = 0.08
+    # Maximum allowed hand-object penetration depth. PhysX reports penetration
+    # as negative contact separation; separation < -threshold fails the grasp.
+    # Unit: metres. Kept at the value previously selected in the wrapper.
+    contact_penetration_threshold = 0.005
+    print_contact_separation = False
+    contact_separation_print_delta = 0.0001
+    platform_drop_height = 0.50
+    target_drop_failure_distance = 0.15
     passive_effort_limit = None
     filter_robot_platform_collision = True
 
-    sim: SimulationCfg = SimulationCfg(
-        dt=dt,
-        render_interval=decimation,
-        physx=PhysxCfg(
-            gpu_max_rigid_patch_count=2**18 * 2**4,
-            gpu_temp_buffer_capacity=2**24 * 2**2,
-            gpu_max_rigid_contact_count=2**23 * 2**2,
-            gpu_heap_capacity=2**26 * 2**2,
-            gpu_found_lost_pairs_capacity=2**21 * 2**2,
-            gpu_found_lost_aggregate_pairs_capacity=2**25 * 2**2,
-            gpu_total_aggregate_pairs_capacity=2**21 * 2**2,
-        ),
-    )
+    sim: SimulationCfg = make_grasp_simulation_cfg()
     robot_cfg: ArticulationCfg = EMPTY_HAND_ENV_CFG.replace(prim_path=robot_prim_path)
     scene: SC.SceneCfg = SC.SceneCfg(num_envs=envs, env_spacing=2, replicate_physics=True)
     scene.platform = RigidObjectCfg(
@@ -219,9 +295,8 @@ class RobotEnv(DirectRLEnv):
         root_state[:, :3] += self.scene.env_origins[env_ids]
         root_state[:, 2] += offsets
         velocity = torch.zeros_like(root_state[:, 7:])
-        velocity[:, 2] = (
-            offsets - self._last_platform_drop_offset[env_ids]
-        ) / float(self.step_dt)
+        # The platform is teleported out of the way. Keep its velocity zero so
+        # the 50 cm jump does not inject a large downward impulse into objects.
         self.platform.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self.platform.write_root_velocity_to_sim(velocity, env_ids)
         self._last_platform_drop_offset[env_ids] = offsets
@@ -264,9 +339,15 @@ class RobotEnv(DirectRLEnv):
             joint_pos=self.joint_pos,
             step_dt=self.step_dt,
             device=self.device,
+            contact_sensor=self.contact_sensor,
             frame_transformer=self.transformer,
             env_origin=self.scene.env_origins,
             debug=self.debug,
+            contact_penetration_threshold=self.cfg.contact_penetration_threshold,
+            print_contact_separation=self.cfg.print_contact_separation,
+            contact_separation_print_delta=self.cfg.contact_separation_print_delta,
+            platform_drop_height=self.cfg.platform_drop_height,
+            target_drop_failure_distance=self.cfg.target_drop_failure_distance,
         )
 
     def _setup_scene(self):
@@ -521,9 +602,10 @@ class RobotEnv(DirectRLEnv):
         print("cur_grasp:", self.act_pol.current_grasp_num)
 
         for index in range(10):
-            if not hasattr(self, f"obj{index:02d}"):
+            name = f"obj{index:02d}"
+            if not hasattr(self, name):
                 continue
-            item = getattr(self, f"obj{index:02d}")
+            item = getattr(self, name)
             default = item.data.default_root_state[env_ids].clone()
             default[:, :3] += self.scene.env_origins[env_ids]
             item.write_root_pose_to_sim(default[:, :7], env_ids)

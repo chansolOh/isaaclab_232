@@ -7,11 +7,14 @@ import os
 import sys
 import csv
 import copy
+import ast
 from pathlib import Path
 
 
-FINGER_GRIPPER_INFO_PATH = Path("/nas/ochansol/gripper_info/gripper_info.json")
-HAND_GRIPPER_INFO_PATH = Path("/nas/ochansol/gripper_info/gripper_info_hand.json")
+FINGER_GRIPPER_INFO_PATH = Path(
+    "/nas/ochansol/gripper_info/gripper_info_new_2026.json"
+)
+HAND_GRIPPER_INFO_PATH = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 # OBJECT_NAME_CSV_PATH = Path("/nas/ochansol/3d_model/2024_2025_objects_cat_attr.csv")
 OBJECT_NAME_CSV_PATH = Path("/nas/ochansol/3d_model/2026_objects_cat_attr.csv")
 CODEX_DIR = Path(__file__).resolve().parent
@@ -19,6 +22,7 @@ LEGACY_CHANSOL_DIR = CODEX_DIR.parent / "chansol"
 HEADLESS = True
 DEBUG_DRAW_PREGRASP = not HEADLESS
 pre_grasp_start_index = 0
+HAND_CONTACT_MAX_DATA_COUNT_PER_PRIM = 32
 
 if str(CODEX_DIR) not in sys.path:
     sys.path.insert(0, str(CODEX_DIR))
@@ -145,20 +149,39 @@ def _object_frame_transformer_setup_with_asset_names(scene, obj_conf: list[dict]
     scene.transformer.target_frames = target_frames
 
 
-def _select_pre_grasp_group(payload, pre_grasp_index: int) -> dict:
+def _configure_hand_contact_separation_filters(
+    scene, obj_conf: list[dict]
+) -> None:
+    """Expose detailed hand-object contacts, including PhysX separation.
+
+    The hand sensor bodies are still selected exclusively from the configured
+    hand contact-sensor prim paths. These filters select the scene rigid bodies
+    against which detailed contact records are requested.
+    """
+    filter_paths = []
+    for index, obj in enumerate(obj_conf[:10]):
+        asset_name = _object_asset_prim_name(obj["usd_path"])
+        filter_paths.append(
+            f"{{ENV_REGEX_NS}}/obj{index:02d}/{asset_name}"
+        )
+    if not filter_paths:
+        raise ValueError("Hand contact-separation checking requires scene objects")
+    scene.contact_sensor.filter_prim_paths_expr = filter_paths
+    scene.contact_sensor.max_contact_data_count_per_prim = (
+        HAND_CONTACT_MAX_DATA_COUNT_PER_PRIM
+    )
+
+
+def _select_pre_grasp_group(payload) -> dict:
     if isinstance(payload, dict):
-        if pre_grasp_index != 0:
-            raise IndexError(
-                "A single pre-grasp group was stored as an object; "
-                "pre_grasp_index must be 0"
-            )
         group = payload
     elif isinstance(payload, list):
-        if not 0 <= pre_grasp_index < len(payload):
-            raise IndexError(
-                f"pre_grasp_index {pre_grasp_index} is outside 0..{len(payload) - 1}"
+        if len(payload) != 1:
+            raise ValueError(
+                "Pre-grasp JSON must contain exactly one gripper group. "
+                "Regenerate pre_grasp with the 2026 random single-gripper collector."
             )
-        group = payload[pre_grasp_index]
+        group = payload[0]
     else:
         raise TypeError("Pre-grasp JSON root must be an object or a list")
 
@@ -214,6 +237,62 @@ def _load_gripper_info(pre_grasp_group: dict, gripper_type: str) -> dict:
     return gripper_info
 
 
+def _inject_missing_hand_preset_metadata(
+    pre_grasp_group: dict, gripper_info: dict
+) -> int:
+    """Add current VIA and contact-set metadata to legacy records in memory."""
+    from pregrasp.hand_pregrasp_heightmap import (
+        preset_contact_sensor_sets,
+        target_pose_from_start_correspondence,
+    )
+
+    presets = {
+        str(preset.get("name")): preset
+        for preset in gripper_info.get("preset", [])
+        if isinstance(preset, dict) and preset.get("name")
+    }
+    updated = 0
+    for record in pre_grasp_group.get("data", []):
+        preset = presets.get(str(record.get("preset_name")))
+        if not isinstance(preset, dict):
+            continue
+        record_updated = False
+        target_base_tf = record.get("target_base_tf")
+        if (
+            isinstance(target_base_tf, dict)
+            and isinstance(preset.get("via_base_tf"), dict)
+            and not isinstance(target_base_tf.get("via"), dict)
+        ):
+            target_start = target_base_tf.get("start")
+            template_start = preset.get("start_base_tf")
+            if isinstance(target_start, dict) and isinstance(template_start, dict):
+                target_base_tf["via"] = target_pose_from_start_correspondence(
+                    template_start, preset["via_base_tf"], target_start
+                )
+                record_updated = True
+        preset_transition = preset.get("transition")
+        if isinstance(preset_transition, dict) and isinstance(
+            preset_transition.get("via_time_ratio"), (int, float)
+        ):
+            record_transition = record.setdefault("transition", {})
+            if isinstance(record_transition, dict) and "via_time_ratio" not in record_transition:
+                record_transition["via_time_ratio"] = float(
+                    preset_transition["via_time_ratio"]
+                )
+                record_updated = True
+        current_contact_sets = preset_contact_sensor_sets(preset)
+        if record.get("contact_sensor_sets") != current_contact_sets:
+            record["contact_sensor_sets"] = current_contact_sets
+            record_updated = True
+        updated += int(record_updated)
+    return updated
+
+
+def _inject_missing_hand_via_metadata(pre_grasp_group: dict, gripper_info: dict) -> int:
+    """Backward-compatible alias for callers using the former helper name."""
+    return _inject_missing_hand_preset_metadata(pre_grasp_group, gripper_info)
+
+
 def _save_output(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -222,7 +301,41 @@ def _save_output(path: Path, records: list[dict]) -> None:
     os.replace(temporary_path, path)
 
 
-def main(root_path, scene_num, pre_grasp_index):
+def _load_debug_instance_colors(root_path: Path, scene_num: int) -> dict[str, list[float]]:
+    """Load the top-view instance colors as normalized RGBA debug colors."""
+    mapping_path = (
+        root_path
+        / "inst_seg"
+        / "top_view_camera"
+        / f"semantics_mapping_{scene_num:04d}.json"
+    )
+    if not mapping_path.exists():
+        print(f"Grasp > debug instance-color mapping not found: {mapping_path}")
+        return {}
+
+    mapping = _load_json(mapping_path)
+    result: dict[str, list[float]] = {}
+    for raw_color, semantic in mapping.items():
+        if not isinstance(semantic, dict):
+            continue
+        class_name = str(semantic.get("class", "")).strip()
+        if not class_name or class_name == "UNLABELLED":
+            continue
+        try:
+            rgba = tuple(int(value) for value in ast.literal_eval(raw_color))
+        except (ValueError, SyntaxError, TypeError):
+            continue
+        if len(rgba) not in (3, 4):
+            continue
+        if len(rgba) == 3:
+            rgba = (*rgba, 255)
+        result[class_name] = [
+            max(0.0, min(1.0, float(value) / 255.0)) for value in rgba
+        ]
+    return result
+
+
+def main(root_path, scene_num):
     import argparse
 
     from isaaclab.app import AppLauncher
@@ -238,13 +351,24 @@ def main(root_path, scene_num, pre_grasp_index):
     conf_file = root_path / "conf" / f"{scene_num:04d}.json"
     output_file = root_path / "output_grasp" / f"{scene_num:04d}.json"
 
-    pre_grasp_group = _select_pre_grasp_group(
-        _load_json(pre_grasp_file), pre_grasp_index
-    )
+    pre_grasp_group = _select_pre_grasp_group(_load_json(pre_grasp_file))
     conf_data = _resolve_conf_object_usd_paths(_load_json(conf_file), OBJECT_NAME_CSV_PATH)
+    if debug_draw_pregrasp:
+        conf_data["debug_instance_colors"] = _load_debug_instance_colors(
+            root_path, scene_num
+        )
     gripper_type = _detect_gripper_type(pre_grasp_group)
     gripper_info = _load_gripper_info(pre_grasp_group, gripper_type)
     is_hand = gripper_type == "hand"
+    if is_hand:
+        injected_metadata_count = _inject_missing_hand_preset_metadata(
+            pre_grasp_group, gripper_info
+        )
+        if injected_metadata_count:
+            print(
+                "Grasp > injected current preset metadata into "
+                f"{injected_metadata_count} legacy pre-grasp record(s)"
+            )
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
     env = None
@@ -252,7 +376,7 @@ def main(root_path, scene_num, pre_grasp_index):
         print("Grasp > App_start")
         print(
             f"Grasp > gripper={pre_grasp_group['gripper_model']} "
-            f"type={gripper_type} policy={'hand preset' if is_hand else 'legacy finger'}"
+            f"type={gripper_type} policy={'hand preset' if is_hand else 'calibrated finger'}"
         )
         if DEBUG_DRAW_PREGRASP and args_cli.headless:
             print("Grasp > debug draw disabled in headless mode")
@@ -266,9 +390,7 @@ def main(root_path, scene_num, pre_grasp_index):
         if is_hand:
             import codex_cfgs.Robot_EnvCfg_hand_platform_filter as cs_robot
         else:
-            # The existing two/three-finger configuration and action policy are
-            # used without modification.
-            import cfgs.Robot_EnvCfg as cs_robot
+            import codex_cfgs.Robot_EnvCfg_finger_platform_filter as cs_robot
         from cfgs.scene_cfg import (
             platform_setup,
             scene_obj_setup,
@@ -293,6 +415,10 @@ def main(root_path, scene_num, pre_grasp_index):
         _object_frame_transformer_setup_with_asset_names(
             env_cfg.scene, conf_data["objects"]
         )
+        if is_hand:
+            _configure_hand_contact_separation_filters(
+                env_cfg.scene, conf_data["objects"]
+            )
 
         print("Grasp > creating environment")
         sys.stdout.flush()
@@ -308,7 +434,6 @@ def main(root_path, scene_num, pre_grasp_index):
         obs, _ = env.reset()
         print("Grasp > START")
         print(f"Grasp > SCENE:{scene_num}")
-        print(f"Grasp > PreGrasp_index:{pre_grasp_index}")
         sys.stdout.flush()
         old_time = time.time()
         minimum_successes = min(5, len(pre_grasp_group["data"][pre_grasp_start_index:]))
@@ -367,4 +492,4 @@ def main(root_path, scene_num, pre_grasp_index):
 
 
 if __name__ == "__main__":
-    main(root_path="", scene_num=0, pre_grasp_index=0)
+    main(root_path="", scene_num=0)

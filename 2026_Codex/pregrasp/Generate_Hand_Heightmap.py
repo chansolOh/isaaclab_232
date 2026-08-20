@@ -9,7 +9,7 @@ Python environment.  Every gripper and preset in the JSON is processed.
 # ---------------------------------------------------------------------------
 HEADLESS = True
 
-GRIPPER_INFO_PATH = "/nas/ochansol/gripper_info/gripper_info_hand.json"
+GRIPPER_INFO_PATH = "/nas/ochansol/gripper_info/gripper_info_hand_2026.json"
 
 GRIPPER_ROOT_PRIM_PATH = "/World/PreGraspHeightMap/Hand"
 TCP_PRIM_PATH = "/World/PreGraspHeightMap/TCP"

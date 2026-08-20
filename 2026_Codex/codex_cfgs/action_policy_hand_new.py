@@ -40,6 +40,78 @@ def _quaternion_slerp(
     return torch.where(dot > 0.9995, linear, spherical)
 
 
+def _interpolate_base_path(
+    start_pos: torch.Tensor,
+    via_pos: torch.Tensor,
+    end_pos: torch.Tensor,
+    start_quat: torch.Tensor,
+    via_quat: torch.Tensor,
+    end_quat: torch.Tensor,
+    progress: torch.Tensor,
+    use_smoothstep: torch.Tensor,
+    use_via: torch.Tensor,
+    via_ratio: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Interpolate a batched base path, preserving straight-path compatibility."""
+    smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+    direct_amount = torch.where(use_smoothstep, smooth_progress, progress)
+    direct_position = torch.lerp(start_pos, end_pos, direct_amount[:, None])
+    direct_orientation = _quaternion_slerp(
+        start_quat, end_quat, direct_amount[:, None]
+    )
+    first_leg = progress <= via_ratio
+    leg_progress = torch.where(
+        first_leg,
+        progress / via_ratio,
+        (progress - via_ratio) / (1.0 - via_ratio),
+    ).clamp(0.0, 1.0)
+    smooth_leg = leg_progress * leg_progress * (3.0 - 2.0 * leg_progress)
+    leg_amount = torch.where(use_smoothstep, smooth_leg, leg_progress)
+    via_position = torch.where(
+        first_leg[:, None],
+        torch.lerp(start_pos, via_pos, leg_amount[:, None]),
+        torch.lerp(via_pos, end_pos, leg_amount[:, None]),
+    )
+    via_orientation = torch.where(
+        first_leg[:, None],
+        _quaternion_slerp(start_quat, via_quat, leg_amount[:, None]),
+        _quaternion_slerp(via_quat, end_quat, leg_amount[:, None]),
+    )
+    return (
+        torch.where(use_via[:, None], via_position, direct_position),
+        torch.where(use_via[:, None], via_orientation, direct_orientation),
+    )
+
+
+def _interpolate_joint_path(
+    start_joint: torch.Tensor,
+    end_joint: torch.Tensor,
+    progress: torch.Tensor,
+    use_smoothstep: torch.Tensor,
+    use_via: torch.Tensor,
+    via_ratio: torch.Tensor,
+) -> torch.Tensor:
+    """Interpolate joint targets with the same START-VIA-END timing as the base."""
+    smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+    direct_amount = torch.where(use_smoothstep, smooth_progress, progress)
+
+    first_leg = progress <= via_ratio
+    leg_progress = torch.where(
+        first_leg,
+        progress / via_ratio,
+        (progress - via_ratio) / (1.0 - via_ratio),
+    ).clamp(0.0, 1.0)
+    smooth_leg = leg_progress * leg_progress * (3.0 - 2.0 * leg_progress)
+    leg_amount = torch.where(use_smoothstep, smooth_leg, leg_progress)
+    via_amount = torch.where(
+        first_leg,
+        via_ratio * leg_amount,
+        via_ratio + (1.0 - via_ratio) * leg_amount,
+    )
+    amount = torch.where(use_via, via_amount, direct_amount)
+    return torch.lerp(start_joint, end_joint, amount[:, None])
+
+
 class HandActionPolicy:
     """Batched hand-grasp controller following the legacy staged policy style."""
 
@@ -54,27 +126,50 @@ class HandActionPolicy:
         joint_pos,
         step_dt,
         device,
+        contact_sensor,
         frame_transformer,
         env_origin,
+        contact_penetration_threshold,
+        platform_drop_height,
+        target_drop_failure_distance,
+        print_contact_separation=False,
+        contact_separation_print_delta=0.0001,
         debug=False,
         approach_duration_sec=1.0,
         lift_duration_sec=1.0,
         lift_height=0.20,
         grasp_joint_error_th=0.03,
         grasp_timeout_sec=2.0,
-        early_fail_check_drop_ratio=0.25,
-        early_fail_success_fraction=0.5,
     ):
         self.env_num = int(env_num)
         self.pre_grasp_data = pre_grasp_data
         self.obj_conf_data = conf_data["objects"]
         self.conf_data = conf_data
+        self.debug_instance_colors = conf_data.get("debug_instance_colors", {})
         self.gripper_info = gripper_info
         self.joint_names = list(joint_names)
         self.joint_index = joint_index
         self.joint_pos = joint_pos
         self.step_dt = float(step_dt)
         self.device = device
+        self.contact_sensor = contact_sensor
+        self.contact_penetration_threshold = float(contact_penetration_threshold)
+        if self.contact_penetration_threshold < 0.0:
+            raise ValueError("contact_penetration_threshold must be non-negative")
+        self.print_contact_separation = bool(print_contact_separation)
+        self.contact_separation_print_delta = float(contact_separation_print_delta)
+        if self.contact_separation_print_delta < 0.0:
+            raise ValueError("contact_separation_print_delta must be non-negative")
+        self._printed_minimum_separation = torch.full(
+            (self.env_num,), torch.inf, dtype=torch.float, device=self.device
+        )
+        self.platform_drop_height = float(platform_drop_height)
+        self.target_drop_failure_distance = float(target_drop_failure_distance)
+        if self.platform_drop_height <= 0.0:
+            raise ValueError("platform_drop_height must be positive")
+        if self.target_drop_failure_distance <= 0.0:
+            raise ValueError("target_drop_failure_distance must be positive")
+        self.contact_sensor_body_names = list(self.contact_sensor.body_names)
         self.frame_transformer = frame_transformer
         self.env_origin = env_origin
         self.debug = debug
@@ -95,12 +190,6 @@ class HandActionPolicy:
         self.lift_steps = max(1, int(round(lift_duration_sec / self.step_dt)))
         self.lift_height = float(lift_height)
         self.lift_success_threshold = 0.02
-        self.early_fail_check_drop = max(
-            0.01, self.lift_height * float(early_fail_check_drop_ratio)
-        )
-        self.early_fail_height_threshold = (
-            self.lift_success_threshold * float(early_fail_success_fraction)
-        )
         self.grasp_joint_error_th = float(grasp_joint_error_th)
         self.grasp_timeout_steps = max(1, int(round(grasp_timeout_sec / self.step_dt)))
 
@@ -110,7 +199,8 @@ class HandActionPolicy:
 
         self._prepare_pre_grasps()
 
-        # 0: approach START from above, 1: interpolate START->END, 2: lift,
+        # 0: approach START from above, 1: base START->VIA->END while joints
+        # command END directly, 2: lift,
         # 3: evaluate/done, 4: disabled.
         self.stage_num = torch.zeros(self.env_num, dtype=torch.long, device=self.device)
         self.stage_step = torch.zeros(self.env_num, dtype=torch.long, device=self.device)
@@ -130,13 +220,19 @@ class HandActionPolicy:
         self.target_points = torch.zeros((self.env_num, 3), dtype=torch.float, device=self.device)
 
         self.start_pos = torch.zeros((self.env_num, 3), dtype=torch.float, device=self.device)
+        self.via_pos = torch.zeros_like(self.start_pos)
         self.end_pos = torch.zeros_like(self.start_pos)
         self.start_quat = torch.zeros((self.env_num, 4), dtype=torch.float, device=self.device)
+        self.via_quat = torch.zeros_like(self.start_quat)
         self.end_quat = torch.zeros_like(self.start_quat)
         self.start_joint = torch.zeros_like(self.target_joint)
         self.end_joint = torch.zeros_like(self.target_joint)
         self.transition_steps = torch.ones(self.env_num, dtype=torch.long, device=self.device)
         self.use_smoothstep = torch.ones(self.env_num, dtype=torch.bool, device=self.device)
+        self.use_via = torch.zeros(self.env_num, dtype=torch.bool, device=self.device)
+        self.via_ratio = torch.full(
+            (self.env_num,), 0.5, dtype=torch.float, device=self.device
+        )
         self.platform_drop_offset = torch.zeros(self.env_num, dtype=torch.float, device=self.device)
 
         self.object_pos_org = torch.tensor(
@@ -208,15 +304,36 @@ class HandActionPolicy:
             return
         points = self.target_points[env_ids] + self.env_origin[env_ids]
         bboxes = self._assigned_bboxes_with_env_origin(env_ids)
-        env_colors = [self._debug_carb.ColorRgba(0.0, 1.0, 0.0, 1.0)] * len(env_ids)
+        env_colors = [
+            self._debug_color_for_source(
+                int(self.assigned_pregrasp[env_id]),
+                fallback=(0.0, 1.0, 0.0, 1.0),
+            )
+            for env_id in env_ids.detach().cpu().tolist()
+        ]
         bbox_counts = self._assigned_bbox_counts(env_ids)
         colors = [
             env_color
             for env_color, bbox_count in zip(env_colors, bbox_counts)
             for _ in range(bbox_count)
         ]
-        self._draw_points(points, self._debug_carb.ColorRgba(0.0, 1.0, 0.0, 1.0), size=16.0)
+        self._debug_draw.draw_points(
+            [
+                self._debug_carb.Float3(*point.tolist())
+                for point in points.detach().cpu().numpy()
+            ],
+            env_colors,
+            [16.0] * len(env_colors),
+        )
         self._draw_bboxes(bboxes, colors, thickness=5.0)
+
+    def _debug_color_for_source(self, source_id: int, fallback):
+        if 0 <= source_id < len(self.pre_grasp_data):
+            target_object = self.pre_grasp_data[source_id].get("target_object")
+            rgba = self.debug_instance_colors.get(target_object)
+            if isinstance(rgba, list) and len(rgba) == 4:
+                return self._debug_carb.ColorRgba(*rgba)
+        return self._debug_carb.ColorRgba(*fallback)
 
     def _assigned_bbox_counts(self, env_ids: torch.Tensor) -> list[int]:
         counts: list[int] = []
@@ -336,13 +453,17 @@ class HandActionPolicy:
             for index, name in enumerate(self.frame_transformer.data.target_frame_names)
         }
         start_pos = []
+        via_pos = []
         end_pos = []
         start_quat = []
+        via_quat = []
         end_quat = []
         start_joint = []
         end_joint = []
         transition_steps = []
         smoothstep = []
+        use_via = []
+        via_ratio = []
         target_class = []
         target_points = []
         grasp_bbox = []
@@ -355,6 +476,12 @@ class HandActionPolicy:
                 )
             start_position, start_orientation = self._require_pose(record, "start")
             end_position, end_orientation = self._require_pose(record, "end")
+            has_via = isinstance(record.get("target_base_tf", {}).get("via"), dict)
+            if has_via:
+                via_position, via_orientation = self._require_pose(record, "via")
+            else:
+                # Compatibility for pre-grasp JSON generated before VIA support.
+                via_position, via_orientation = start_position, start_orientation
             target_object = record["target_object"]
             if target_object not in class_name_idx:
                 raise KeyError(f"Target object {target_object!r} is not present in the scene")
@@ -367,15 +494,24 @@ class HandActionPolicy:
                 raise ValueError(
                     f"Unsupported hand transition interpolation: {interpolation!r}"
                 )
+            ratio = float(record.get("transition", {}).get("via_time_ratio", 0.5))
+            if not 0.0 < ratio < 1.0:
+                raise ValueError(
+                    f"Hand transition via_time_ratio must be between 0 and 1: {ratio}"
+                )
 
             start_pos.append(start_position)
+            via_pos.append(via_position)
             end_pos.append(end_position)
             start_quat.append(start_orientation)
+            via_quat.append(via_orientation)
             end_quat.append(end_orientation)
             start_joint.append(self._joint_vector(record, "start"))
             end_joint.append(self._joint_vector(record, "end"))
             transition_steps.append(max(1, int(round((duration * 0.5) / self.step_dt))))
             smoothstep.append(interpolation == "smoothstep")
+            use_via.append(has_via)
+            via_ratio.append(ratio)
             target_class.append(class_name_idx[target_object])
             target_points.append(record["target_points"])
             if "grasp_bbox" not in record:
@@ -395,13 +531,17 @@ class HandActionPolicy:
             return torch.tensor(values, dtype=dtype, device=self.device)
 
         self.total_start_pos = tensor(start_pos)
+        self.total_via_pos = tensor(via_pos)
         self.total_end_pos = tensor(end_pos)
         self.total_start_quat = _normalise_quaternion(tensor(start_quat))
+        self.total_via_quat = _normalise_quaternion(tensor(via_quat))
         self.total_end_quat = _normalise_quaternion(tensor(end_quat))
         self.total_start_joint = tensor(start_joint)
         self.total_end_joint = tensor(end_joint)
         self.total_transition_steps = tensor(transition_steps, dtype=torch.long)
         self.total_smoothstep = tensor(smoothstep, dtype=torch.bool)
+        self.total_use_via = tensor(use_via, dtype=torch.bool)
+        self.total_via_ratio = tensor(via_ratio)
         self.total_class = tensor(target_class, dtype=torch.long)
         self.total_target_points = tensor(target_points)
         self.total_grasp_bboxes = grasp_bbox
@@ -419,6 +559,7 @@ class HandActionPolicy:
 
     def reset(self, env_ids) -> None:
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        self._printed_minimum_separation[env_ids] = torch.inf
         remaining = self.total_grasp_num - self.current_grasp_num
         if remaining <= 0:
             self._set_disabled(env_ids)
@@ -443,13 +584,17 @@ class HandActionPolicy:
         self.platform_drop_offset[active_envs] = 0.0
 
         self.start_pos[active_envs] = self.total_start_pos[source_ids]
+        self.via_pos[active_envs] = self.total_via_pos[source_ids]
         self.end_pos[active_envs] = self.total_end_pos[source_ids]
         self.start_quat[active_envs] = self.total_start_quat[source_ids]
+        self.via_quat[active_envs] = self.total_via_quat[source_ids]
         self.end_quat[active_envs] = self.total_end_quat[source_ids]
         self.start_joint[active_envs] = self.total_start_joint[source_ids]
         self.end_joint[active_envs] = self.total_end_joint[source_ids]
         self.transition_steps[active_envs] = self.total_transition_steps[source_ids]
         self.use_smoothstep[active_envs] = self.total_smoothstep[source_ids]
+        self.use_via[active_envs] = self.total_use_via[source_ids]
+        self.via_ratio[active_envs] = self.total_via_ratio[source_ids]
         self.target_class[active_envs] = self.total_class[source_ids]
         self.target_points[active_envs] = self.total_target_points[source_ids]
 
@@ -478,11 +623,6 @@ class HandActionPolicy:
             if len(done):
                 self.stage_num[done] = 1
                 self.stage_step[done] = 0
-                # Hand grasp closing is delegated to the joint drive/controller.
-                # Do not interpolate START->END every frame: issue the END pose
-                # once on stage entry and let the USD/PhysX controller handle it.
-                self.target_joint[done] = self.end_joint[done]
-                self.joint_command_dirty[done] = True
 
         stage1 = torch.where(active & (self.stage_num == 1))[0]
         if len(stage1):
@@ -490,15 +630,31 @@ class HandActionPolicy:
                 (self.stage_step[stage1] + 1).float()
                 / self.transition_steps[stage1].float()
             ).clamp(0.0, 1.0)
-            smooth = progress * progress * (3.0 - 2.0 * progress)
-            amount = torch.where(self.use_smoothstep[stage1], smooth, progress)
-            self.root_pose[stage1, :3] = torch.lerp(
-                self.start_pos[stage1], self.end_pos[stage1], amount[:, None]
+            base_position, base_orientation = _interpolate_base_path(
+                self.start_pos[stage1],
+                self.via_pos[stage1],
+                self.end_pos[stage1],
+                self.start_quat[stage1],
+                self.via_quat[stage1],
+                self.end_quat[stage1],
+                progress,
+                self.use_smoothstep[stage1],
+                self.use_via[stage1],
+                self.via_ratio[stage1],
             )
-            self.root_pose[stage1, 3:7] = _quaternion_slerp(
-                self.start_quat[stage1], self.end_quat[stage1], amount[:, None]
+            self.root_pose[stage1, :3] = base_position
+            self.root_pose[stage1, 3:7] = base_orientation
+            self.target_joint[stage1] = _interpolate_joint_path(
+                self.start_joint[stage1],
+                self.end_joint[stage1],
+                progress,
+                self.use_smoothstep[stage1],
+                self.use_via[stage1],
+                self.via_ratio[stage1],
             )
-            self.target_joint[stage1] = self.end_joint[stage1]
+            # Update the controller target every simulation step so the joint
+            # motion stays synchronized with the START-VIA-END base path.
+            self.joint_command_dirty[stage1] = True
             self.stage_step[stage1] += 1
             joint_error = torch.linalg.vector_norm(
                 self.joint_pos[stage1][:, self.joint_index] - self.end_joint[stage1],
@@ -516,14 +672,13 @@ class HandActionPolicy:
 
         stage2 = torch.where(active & (self.stage_num == 2))[0]
         if len(stage2):
-            progress = ((self.stage_step[stage2] + 1).float() / self.lift_steps).clamp(0.0, 1.0)
             self.root_pose[stage2, :3] = self.end_pos[stage2]
             self.root_pose[stage2, 3:7] = self.end_quat[stage2]
             self.target_joint[stage2] = self.end_joint[stage2]
             # Do not lift/teleport the hand root after closing.  Lower the
-            # support platform instead so the grasp can be evaluated without
-            # forcing the hand through contact constraints.
-            self.platform_drop_offset[stage2] = -self.lift_height * progress
+            # support platform in one jump, then keep it there while the grasp
+            # is evaluated.
+            self.platform_drop_offset[stage2] = -self.platform_drop_height
             self.stage_step[stage2] += 1
             done = stage2[self.stage_step[stage2] >= self.lift_steps]
             self.stage_num[done] = 3
@@ -543,36 +698,159 @@ class HandActionPolicy:
         )
         return height_delta, target_positions, platform_drop
 
-    def _mark_stage2_early_failures(self) -> None:
+    def _mark_target_drop_failures(self) -> torch.Tensor:
+        """Fail once the target falls too far below its original world Z."""
+        done = torch.zeros(self.env_num, dtype=torch.bool, device=self.device)
         idx = torch.where(
             (self.action_enable == 1)
-            & (self.stage_num == 2)
-            & (-self.platform_drop_offset.clamp(max=0.0) >= self.early_fail_check_drop)
+            & ((self.stage_num == 2) | (self.stage_num == 3))
+            & ~self.recorded
+            & ~self.grasp_fail_idx
         )[0]
         if len(idx) == 0:
-            return
+            return done
 
-        height_delta, target_positions, platform_drop = self._target_height_delta(idx)
-        fail = height_delta < self.early_fail_height_threshold
+        object_positions = self.frame_transformer.data.target_pos_source[idx]
+        target_positions = object_positions[
+            torch.arange(len(idx), device=self.device), self.target_class[idx]
+        ]
+        original_target_z = self.object_pos_org[self.target_class[idx], 2]
+        drop_distance = original_target_z - target_positions[:, 2]
+        fail = drop_distance >= self.target_drop_failure_distance
         fail_env_ids = idx[fail]
         if len(fail_env_ids) == 0:
-            return
+            return done
 
         self.grasp_fail_idx[fail_env_ids] = True
         self.stage_num[fail_env_ids] = 3
         self.stage_step[fail_env_ids] = 0
+        done[fail_env_ids] = True
 
         if self.debug:
-            for local_index, env_id in enumerate(fail_env_ids.detach().cpu().tolist()):
+            for failed_index, env_id in zip(
+                torch.where(fail)[0].detach().cpu().tolist(),
+                fail_env_ids.detach().cpu().tolist(),
+            ):
                 source_id = int(self.assigned_pregrasp[int(env_id)])
                 print(
-                    "HandActionPolicy > early_fail "
+                    "HandActionPolicy > target_dropped "
                     f"env={int(env_id)} source={source_id} "
-                    f"z_delta={float(height_delta[fail][local_index]):.5f} "
-                    f"threshold={self.early_fail_height_threshold:.5f} "
-                    f"target_z={float(target_positions[fail][local_index, 2]):.5f} "
-                    f"platform_drop={float(platform_drop[fail][local_index]):.5f}"
+                    f"drop_distance={float(drop_distance[failed_index]):.5f} "
+                    f"threshold={self.target_drop_failure_distance:.5f}"
                 )
+        return done
+
+    def _minimum_contact_separation_by_env(self) -> torch.Tensor:
+        """Return the deepest hand-object contact separation in every env."""
+        contact_view = self.contact_sensor.contact_physx_view
+        if int(contact_view.filter_count) < 1:
+            raise RuntimeError(
+                "Hand penetration checking requires contact sensor object filters"
+            )
+
+        _, _, _, separations, counts, starts = contact_view.get_contact_data(
+            dt=self.step_dt
+        )
+        counts = counts.reshape(-1).to(device=self.device, dtype=torch.long)
+        starts = starts.reshape(-1).to(device=self.device, dtype=torch.long)
+        minimum = torch.full(
+            (self.env_num,),
+            torch.inf,
+            dtype=separations.dtype,
+            device=self.device,
+        )
+        total_contacts = int(counts.sum().item())
+        if total_contacts == 0:
+            return minimum
+
+        pair_ids = torch.repeat_interleave(
+            torch.arange(counts.numel(), device=self.device), counts
+        )
+        packed_starts = counts.cumsum(0) - counts
+        offsets = torch.arange(total_contacts, device=self.device) - (
+            packed_starts.repeat_interleave(counts)
+        )
+        contact_indices = starts[pair_ids] + offsets
+        valid_separations = separations.reshape(-1).index_select(
+            0, contact_indices
+        )
+
+        filter_count = int(contact_view.filter_count)
+        sensor_ids = pair_ids // filter_count
+        contact_env_ids = sensor_ids // int(self.contact_sensor.num_bodies)
+        minimum.scatter_reduce_(
+            0,
+            contact_env_ids,
+            valid_separations,
+            reduce="amin",
+            include_self=True,
+        )
+        return minimum
+
+    def _mark_penetration_failures(self) -> torch.Tensor:
+        """Immediately fail active grasps with excessive object penetration."""
+        done = torch.zeros(self.env_num, dtype=torch.bool, device=self.device)
+        eligible = (
+            (self.action_enable == 1)
+            & (self.stage_num <= 3)
+            & ~self.recorded
+            & ~self.grasp_fail_idx
+        )
+        if not torch.any(eligible):
+            return done
+
+        # Avoid requesting the much larger detailed contact buffer while no
+        # configured hand contact-sensor body is touching anything.
+        net_forces = self.contact_sensor.data.net_forces_w
+        touching = torch.linalg.vector_norm(net_forces, dim=-1).amax(dim=1) > 0.0
+        if not torch.any(eligible & touching):
+            return done
+
+        minimum_separation = self._minimum_contact_separation_by_env()
+        if self.print_contact_separation:
+            finite = eligible & touching & torch.isfinite(minimum_separation)
+            deeper = minimum_separation < (
+                self._printed_minimum_separation
+                - self.contact_separation_print_delta
+            )
+            print_env_ids = torch.where(finite & deeper)[0]
+            for env_id in print_env_ids.detach().cpu().tolist():
+                separation = float(minimum_separation[env_id])
+                penetration = max(0.0, -separation)
+                source_id = int(self.assigned_pregrasp[env_id])
+                print(
+                    "Replay > hand_contact_separation "
+                    f"env={env_id} source={source_id} "
+                    f"stage={int(self.stage_num[env_id])} "
+                    f"separation={separation:.6f} m "
+                    f"penetration={penetration * 1000.0:.3f} mm",
+                    flush=True,
+                )
+            self._printed_minimum_separation[print_env_ids] = (
+                minimum_separation[print_env_ids]
+            )
+        failed = eligible & (
+            minimum_separation < -self.contact_penetration_threshold
+        )
+        failed_env_ids = torch.where(failed)[0]
+        if len(failed_env_ids) == 0:
+            return done
+
+        self.grasp_fail_idx[failed_env_ids] = True
+        self.stage_num[failed_env_ids] = 3
+        self.stage_step[failed_env_ids] = 0
+        done[failed_env_ids] = True
+
+        if self.debug:
+            for env_id in failed_env_ids.detach().cpu().tolist():
+                source_id = int(self.assigned_pregrasp[env_id])
+                print(
+                    "HandActionPolicy > penetration_fail "
+                    f"env={env_id} source={source_id} "
+                    f"minimum_separation={float(minimum_separation[env_id]):.6f} "
+                    f"threshold=-{self.contact_penetration_threshold:.6f}"
+                )
+        return done
 
     def _append_success_records(self, env_ids: torch.Tensor) -> None:
         if len(env_ids) == 0:
@@ -580,9 +858,32 @@ class HandActionPolicy:
         
         object_positions = self.frame_transformer.data.target_pos_source[env_ids]
         height_delta, target_positions, platform_drop = self._target_height_delta(env_ids)
-        # The hand no longer lifts the object.  A successful grasp keeps the
-        # target near its original world height while the platform drops away.
-        success = height_delta > self.lift_success_threshold
+        expected_platform_z = (
+            self.object_pos_org[None, :, 2] - platform_drop[:, None]
+        )
+        object_platform_separation = (
+            object_positions[:, :, 2] - expected_platform_z
+        )
+        non_target_mask = torch.ones_like(
+            object_platform_separation, dtype=torch.bool
+        )
+        non_target_mask.scatter_(
+            1, self.target_class[env_ids].unsqueeze(1), False
+        )
+        collateral_grasp_mask = non_target_mask & (
+            object_platform_separation > self.lift_success_threshold
+        )
+        collateral_grasped = collateral_grasp_mask.any(dim=1)
+        collateral_grasp_counts = collateral_grasp_mask.sum(dim=1)
+        # The target must remain separated from the lowering platform.  Small
+        # center-Z changes caused by tilting inside the grasp are allowed.  A
+        # non-target object remaining separated from the lowered platform means
+        # that the grasp picked multiple objects and must be rejected.
+        success = (
+            ~self.grasp_fail_idx[env_ids]
+            & (height_delta > self.lift_success_threshold)
+            & ~collateral_grasped
+        )
         if self.debug:
             for local_index, env_id in enumerate(env_ids.detach().cpu().tolist()):
                 source_id = int(self.assigned_pregrasp[int(env_id)])
@@ -590,13 +891,19 @@ class HandActionPolicy:
                     "HandActionPolicy > grasp_result "
                     f"env={int(env_id)} source={source_id} "
                     f"success={bool(success[local_index])} "
-                    f"z_delta={float(height_delta[local_index]):.5f} "
+                    f"platform_separation={float(height_delta[local_index]):.5f} "
                     f"threshold={self.lift_success_threshold:.5f} "
                     f"target_z={float(target_positions[local_index, 2]):.5f} "
-                    f"early_fail={bool(self.grasp_fail_idx[int(env_id)])} "
+                    f"pre_final_fail={bool(self.grasp_fail_idx[int(env_id)])} "
+                    f"collateral_grasped={bool(collateral_grasped[local_index])} "
+                    f"collateral_count={int(collateral_grasp_counts[local_index])} "
                     f"platform_drop={float(platform_drop[local_index]):.5f}"
                 )
         self._draw_grasp_results(env_ids, success)
+
+        failed_env_ids = env_ids[~success]
+        if len(failed_env_ids):
+            self.grasp_fail_idx[failed_env_ids] = True
 
         compensated_object_positions = object_positions.clone()
         compensated_object_positions[:, :, 2] += platform_drop[:, None]
@@ -630,17 +937,21 @@ class HandActionPolicy:
                 "selected_heightmap_yaw",
                 "first_contact_z",
                 "safety_margin",
+                "grasp_bbox_sets",
+                "contact_sensor_sets",
             ):
                 if optional_key in source:
                     record[optional_key] = copy.deepcopy(source[optional_key])
             self.output_list.append(record)
 
     def get_done_idx(self) -> torch.Tensor:
-        self.grasp_fail_idx[:] = False
-        self._mark_stage2_early_failures()
+        penetration_failed = self._mark_penetration_failures()
+        target_dropped = self._mark_target_drop_failures()
         done = (self.stage_num == 3) & (self.action_enable == 1)
-        new_done = done & ~self.recorded
+        new_done = done & ~self.recorded & ~self.grasp_fail_idx
         env_ids = torch.where(new_done)[0]
         self._append_success_records(env_ids)
         self.recorded[env_ids] = True
-        return done
+        failed = done & self.grasp_fail_idx
+        self.recorded[failed] = True
+        return done | target_dropped | penetration_failed

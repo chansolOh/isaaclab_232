@@ -1,4 +1,4 @@
-"""Collect hand pre-grasp candidates for one rendered dataset folder.
+"""Collect hand and two/three-finger pre-grasp candidates.
 
 This script is Isaac-free.  It reuses the saved hand bottom height maps and
 creates pre-grasp JSON files beside the input scene data:
@@ -23,17 +23,34 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hand_pregrasp_heightmap as heightmap
+import finger_pregrasp_sampler as finger_sampler
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 DATASET_ROOT = Path(
-    "/nas/Dataset/Dataset_2026/dataset_v2/Logistic_site/"
-    "General_LogisticSite/conveyor_track_01"
+    "/nas/Dataset/Dataset_2026/dataset_v2/Home/"
+    "MasterBedroom/beside_table_01"
 )
-GRIPPER_INFO_PATH = Path("/nas/ochansol/gripper_info/gripper_info_hand.json")
+GRIPPER_INFO_PATH = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
+FINGER_GRIPPER_INFO_PATH = Path(
+    "/nas/ochansol/gripper_info/gripper_info_new_2026.json"
+)
 CAMERA_NAME = "top_view_camera"
+
+ENABLE_HAND_GRIPPERS = True
+ENABLE_FINGER_GRIPPERS = True
+# RANDOM_GRIPPER_CANDIDATES = ("Robotiq_2f140", "Inspire-F1", "Hitbot_z_efg_100")
+# RANDOM_GRIPPER_CANDIDATES = ("Agibot-Omnihand-Pro_right", "Inspire-F1_right", "Leap-Hand-V1_right")
+RANDOM_GRIPPER_CANDIDATES = ("UON_3finger_gripper",)
+# Direct execution without CLI arguments uses the candidate list above. Any
+# CLI/server argument switches this off and samples from every usable hand and
+# finger gripper in the two databases.
+FILTER_GRIPPERS_BY_CANDIDATES = True
+FINGER_YAW_STEP_DEG = 10
+FINGER_WIDTH_RATIOS = (1.0, 0.8, 0.6, 0.4)
+FINGER_MIN_DEPTH_GAP = 0.01
 
 OUTPUT_FOLDER_NAME = "pre_grasp"
 HEIGHTMAP_FOLDER_NAME = "heightmaps"
@@ -41,7 +58,7 @@ HEIGHTMAP_FOLDER_NAME = "heightmaps"
 # Scene selection
 #   None: discover and process every scene under depth/<CAMERA_NAME>.
 #   3: process only scene 0003.
-SCENE_NUMBER = 0
+SCENE_NUMBER = 1
 
 # True: keep an existing pre_grasp/<scene_id>.json and move to the next scene.
 # False: regenerate and overwrite an existing output file.
@@ -56,11 +73,13 @@ RANDOM_SEED = None
 
 # Optional preset grasp-BBox filter. Height is always calculated from the hand
 # collision height map first. When enabled, the min/max scene-depth range is
-# checked independently inside every preset BBox. Segmentation is not used;
-# the candidate passes when at least two individual BBoxes pass.
+# checked independently inside every preset BBox. Segmentation is not used.
+# BBoxes in one contact_set are OR alternatives; every contact_set must pass.
 ENABLE_BBOX_FILTER = True
 BBOX_FILTER_MIN_DEPTH_RANGE = 0.01
-BBOX_FILTER_MIN_PASS_COUNT = 2
+# After placing the hand at the height-map target Z, scene geometry inside a
+# passing BBox must rise this far above the hand height map's lowest point.
+BBOX_FILTER_MIN_HEIGHT_ABOVE_GRIPPER_BOTTOM = 0.01
 BBOX_FILTER_SPATIAL_CELL_SIZE = 0.02
 
 # Same sweep style as the old sampler: yaw_max, yaw_max-10, ..., 10.
@@ -311,7 +330,8 @@ def visualize_bbox_filter_2d(
     for axis in axes:
         depth_image = axis.imshow(valid_depth, cmap="viridis")
         for bbox_index, bbox in enumerate(bboxes):
-            colour = colours(bbox_index % 10)
+            set_id = filter_result["bbox_sets"][bbox_index]
+            colour = colours((set_id - 1) % 10)
             bbox_pixels, bbox_valid = world_points_to_image_pixels(bbox, camera)
             if np.all(bbox_valid):
                 closed = np.vstack((bbox_pixels, bbox_pixels[0]))
@@ -320,20 +340,29 @@ def visualize_bbox_filter_2d(
                     closed[:, 1],
                     color=colour,
                     linewidth=2.0,
-                    label=f"bbox {bbox_index}",
+                    label=f"bbox {bbox_index} / set {set_id}",
                 )
                 centre = np.mean(bbox_pixels, axis=0)
                 bbox_range = filter_result["bbox_depth_ranges"][bbox_index]
+                height_above_bottom = filter_result[
+                    "bbox_height_above_gripper_bottom"
+                ][bbox_index]
                 bbox_passed = filter_result["bbox_passed"][bbox_index]
                 range_text = (
                     "empty"
                     if bbox_range is None
-                    else f"{bbox_range * 1000.0:.1f} mm"
+                    else f"range={bbox_range * 1000.0:.1f} mm"
+                )
+                height_text = (
+                    ""
+                    if height_above_bottom is None
+                    else f"\nrise={height_above_bottom * 1000.0:.1f} mm"
                 )
                 axis.text(
                     centre[0],
                     centre[1],
-                    f"{bbox_index}: {'P' if bbox_passed else 'F'}\n{range_text}",
+                    f"B{bbox_index} S{set_id}: {'P' if bbox_passed else 'F'}\n"
+                    f"{range_text}{height_text}",
                     color="white",
                     fontsize=9,
                     ha="center",
@@ -397,7 +426,8 @@ def visualize_bbox_filter_2d(
         f"yaw={yaw:.1f} | {'PASS' if filter_passed else 'REJECT'} | "
         f"passed BBoxes={filter_result['passed_count']}/"
         f"{filter_result['bbox_count']} "
-        f"(required={filter_result['required_count']})"
+        f"| passed sets={filter_result['passed_set_count']}/"
+        f"{filter_result['set_count']}"
     )
     figure.colorbar(depth_image, ax=axes, fraction=0.025, pad=0.02, label="Depth [m]")
     plt.show()
@@ -603,6 +633,41 @@ def preset_relative_bboxes(preset: dict) -> list[np.ndarray]:
     return [bbox - bbox_extent_center for bbox in world_bboxes]
 
 
+def preset_bbox_sets(preset: dict) -> list[int]:
+    """Return contact-set IDs in the same order as ``preset_relative_bboxes``.
+
+    Legacy fingertips without ``contact_set`` each become an independent set,
+    so every selected fingertip remains required until the user groups them.
+    """
+    fingertips = preset.get("fingertip_points", {})
+    if not isinstance(fingertips, dict) or not fingertips:
+        raise ValueError(
+            f"Preset {preset.get('name', '<unnamed>')!r} has no fingertip grasp_bbox"
+        )
+    raw_sets = [
+        fingertip.get("contact_set") if isinstance(fingertip, dict) else None
+        for fingertip in fingertips.values()
+    ]
+    explicit_sets = {
+        raw_set
+        for raw_set in raw_sets
+        if isinstance(raw_set, int) and not isinstance(raw_set, bool) and raw_set >= 1
+    }
+    result: list[int] = []
+    used_sets = set(explicit_sets)
+    next_set = 1
+    for raw_set in raw_sets:
+        if isinstance(raw_set, int) and not isinstance(raw_set, bool) and raw_set >= 1:
+            result.append(raw_set)
+            continue
+        while next_set in used_sets:
+            next_set += 1
+        result.append(next_set)
+        used_sets.add(next_set)
+        next_set += 1
+    return result
+
+
 def record_grasp_bbox(record: dict, preset: dict) -> list[list[list[float]]]:
     target_point = np.asarray(record["target_points"], dtype=np.float64)
     yaw = float(record.get("selected_heightmap_yaw", record.get("requested_yaw", 0.0)))
@@ -702,22 +767,41 @@ class XYPointIndex:
 
 def hand_bbox_filter_passes(
     grasp_bboxes: list[list[list[float]]] | np.ndarray,
+    bbox_sets: list[int] | np.ndarray,
     scene_point_index: XYPointIndex,
+    gripper_lowest_world_z: float,
 ) -> tuple[bool, dict]:
-    """Check the min/max scene-depth range of each preset BBox independently.
+    """Check scene depth and usable object height inside every preset BBox.
 
     Only top-view scene depth is used. An empty BBox fails only its own check;
-    no target segmentation is required. At least
-    ``BBOX_FILTER_MIN_PASS_COUNT`` BBoxes must pass.
+    no target segmentation is required. BBoxes in one set are OR alternatives;
+    all sets are combined with AND. A BBox passes only when both of these are
+    true:
+
+    1. Its scene-depth min/max range reaches ``BBOX_FILTER_MIN_DEPTH_RANGE``.
+    2. Its highest scene point is at least
+       ``BBOX_FILTER_MIN_HEIGHT_ABOVE_GRIPPER_BOTTOM`` above the lowest point
+       of the placed gripper bottom height map.
     """
     bboxes = np.asarray(grasp_bboxes, dtype=np.float64)
     if bboxes.ndim != 3 or bboxes.shape[1:] != (4, 3) or len(bboxes) == 0:
         raise ValueError(f"grasp_bboxes must have shape (N, 4, 3), got {bboxes.shape}")
+    sets = np.asarray(bbox_sets)
+    if sets.shape != (len(bboxes),):
+        raise ValueError(
+            f"bbox_sets must contain one set ID per BBox, got {sets.shape} for {len(bboxes)}"
+        )
+    if not np.issubdtype(sets.dtype, np.integer) or np.any(sets < 1):
+        raise ValueError(f"bbox_sets must contain positive integers, got {sets.tolist()}")
+    sets = sets.astype(np.int64)
 
     bbox_point_counts: list[int] = []
     bbox_depth_min: list[float | None] = []
     bbox_depth_max: list[float | None] = []
     bbox_depth_ranges: list[float | None] = []
+    bbox_depth_range_passed: list[bool] = []
+    bbox_height_above_gripper_bottom: list[float | None] = []
+    bbox_height_passed: list[bool] = []
     bbox_passed: list[bool] = []
     for bbox in bboxes:
         scene_points = scene_point_index.points_in_convex_polygon(bbox)
@@ -726,28 +810,55 @@ def hand_bbox_filter_passes(
             bbox_depth_min.append(None)
             bbox_depth_max.append(None)
             bbox_depth_ranges.append(None)
+            bbox_depth_range_passed.append(False)
+            bbox_height_above_gripper_bottom.append(None)
+            bbox_height_passed.append(False)
             bbox_passed.append(False)
             continue
 
         depth_min = float(np.min(scene_points[:, 2]))
         depth_max = float(np.max(scene_points[:, 2]))
         depth_range = depth_max - depth_min
-        passed = depth_range >= float(BBOX_FILTER_MIN_DEPTH_RANGE)
+        depth_range_passed = depth_range >= float(BBOX_FILTER_MIN_DEPTH_RANGE)
+        height_above_gripper_bottom = depth_max - float(gripper_lowest_world_z)
+        height_passed = height_above_gripper_bottom >= float(
+            BBOX_FILTER_MIN_HEIGHT_ABOVE_GRIPPER_BOTTOM
+        )
+        passed = depth_range_passed and height_passed
         bbox_depth_min.append(depth_min)
         bbox_depth_max.append(depth_max)
         bbox_depth_ranges.append(depth_range)
+        bbox_depth_range_passed.append(depth_range_passed)
+        bbox_height_above_gripper_bottom.append(height_above_gripper_bottom)
+        bbox_height_passed.append(height_passed)
         bbox_passed.append(passed)
 
     passed_count = int(sum(bbox_passed))
-    required_count = int(BBOX_FILTER_MIN_PASS_COUNT)
-    return passed_count >= required_count, {
+    unique_sets = sorted(int(value) for value in np.unique(sets))
+    set_passed = {
+        set_id: any(
+            bbox_passed[index]
+            for index in range(len(bbox_passed))
+            if int(sets[index]) == set_id
+        )
+        for set_id in unique_sets
+    }
+    passed_set_count = int(sum(set_passed.values()))
+    return passed_set_count == len(unique_sets), {
         "bbox_count": int(len(bboxes)),
-        "required_count": required_count,
         "passed_count": passed_count,
+        "bbox_sets": sets.tolist(),
+        "set_count": len(unique_sets),
+        "passed_set_count": passed_set_count,
+        "set_passed": set_passed,
         "bbox_point_counts": bbox_point_counts,
         "bbox_depth_min": bbox_depth_min,
         "bbox_depth_max": bbox_depth_max,
         "bbox_depth_ranges": bbox_depth_ranges,
+        "bbox_depth_range_passed": bbox_depth_range_passed,
+        "gripper_lowest_world_z": float(gripper_lowest_world_z),
+        "bbox_height_above_gripper_bottom": bbox_height_above_gripper_bottom,
+        "bbox_height_passed": bbox_height_passed,
         "bbox_passed": bbox_passed,
     }
 
@@ -772,12 +883,60 @@ def load_heightmap_archives(database: dict) -> dict[str, list[tuple[dict, dict, 
     return archives
 
 
+def select_scene_gripper(
+    hand_database: dict,
+    finger_database: dict,
+    rng: np.random.Generator,
+) -> tuple[str, str]:
+    """Choose exactly one gripper for this pre-grasp run."""
+    candidates: list[tuple[str, str]] = []
+    if FILTER_GRIPPERS_BY_CANDIDATES:
+        gripper_names = list(dict.fromkeys(RANDOM_GRIPPER_CANDIDATES))
+    else:
+        gripper_names = list(
+            dict.fromkeys([*hand_database.keys(), *finger_database.keys()])
+        )
+
+    for gripper_name in gripper_names:
+        if (
+            ENABLE_HAND_GRIPPERS
+            and gripper_name in hand_database
+            and hand_database[gripper_name].get("preset")
+            and all(
+                heightmap_path(gripper_name, preset.get("name")).exists()
+                for preset in hand_database[gripper_name].get("preset", [])
+            )
+        ):
+            candidates.append(("hand", gripper_name))
+        if (
+            ENABLE_FINGER_GRIPPERS
+            and gripper_name in finger_database
+            and finger_sampler.has_pregrasp_geometry(finger_database[gripper_name])
+        ):
+            candidates.append(("finger", gripper_name))
+
+    if not candidates:
+        selection_source = (
+            f"RANDOM_GRIPPER_CANDIDATES={RANDOM_GRIPPER_CANDIDATES}"
+            if FILTER_GRIPPERS_BY_CANDIDATES
+            else "the complete hand/finger databases"
+        )
+        raise ValueError(
+            f"No usable gripper was found from {selection_source}"
+        )
+    gripper_kind, gripper_name = candidates[int(rng.integers(len(candidates)))]
+    return gripper_kind, gripper_name
+
+
 def save_grouped_records(output_path: Path, grouped_records: dict[str, list[dict]]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [
-        {"gripper_model": gripper_name, "data": records}
-        for gripper_name, records in grouped_records.items()
-    ]
+    if len(grouped_records) != 1:
+        raise ValueError(
+            "Each scene must save exactly one gripper group, got "
+            f"{list(grouped_records.keys())}"
+        )
+    gripper_name, records = next(iter(grouped_records.items()))
+    payload = {"gripper_model": gripper_name, "data": records}
     temporary_path = output_path.with_suffix(
         f"{output_path.suffix}.tmp.{os.getpid()}"
     )
@@ -788,7 +947,8 @@ def save_grouped_records(output_path: Path, grouped_records: dict[str, list[dict
 
 def collect_scene(
     scene_id: str,
-    database_archives: dict[str, list[tuple[dict, dict, dict, Path]]],
+    hand_database: dict,
+    finger_database: dict,
     rng: np.random.Generator,
 ) -> dict:
     depth_path = DATASET_ROOT / "depth" / CAMERA_NAME / f"{scene_id}.npy"
@@ -810,16 +970,35 @@ def collect_scene(
     )
     scene_point_index = (
         XYPointIndex(scene_points, BBOX_FILTER_SPATIAL_CELL_SIZE)
-        if ENABLE_BBOX_FILTER or DEBUG_VISUALIZE_BBOX_2D
+        if ENABLE_BBOX_FILTER or DEBUG_VISUALIZE_BBOX_2D or ENABLE_FINGER_GRIPPERS
         else None
     )
     class_masks = load_class_masks(segmentation_path, mapping_path)
+    selected_gripper_kind, selected_gripper_name = select_scene_gripper(
+        hand_database, finger_database, rng
+    )
+    if selected_gripper_kind == "hand":
+        database_archives = load_heightmap_archives(
+            {selected_gripper_name: hand_database[selected_gripper_name]}
+        )
+        selected_finger_database = {}
+    else:
+        database_archives = {}
+        selected_finger_database = {
+            selected_gripper_name: finger_database[selected_gripper_name]
+        }
+    print(
+        f"PreGrasp > selected_gripper:{selected_gripper_name} "
+        f"kind:{selected_gripper_kind}",
+        flush=True,
+    )
 
     grouped_records: dict[str, list[dict]] = {}
     failures: list[str] = []
     object_count = 0
     bbox_filter_evaluated = 0
     bbox_filter_rejected = 0
+    class_candidates: dict[str, np.ndarray] = {}
 
     for class_name, mask in class_masks.items():
         candidates, sampled_pixels, object_point_count = sample_object_candidates(
@@ -828,6 +1007,8 @@ def collect_scene(
         if candidates.shape[0] < 1:
             failures.append(f"{class_name}: not enough valid depth points")
             continue
+
+        class_candidates[class_name] = candidates
 
         if DEBUG_VISUALIZE_SAMPLING and (
             DEBUG_SCENE_IDS is None or scene_id in DEBUG_SCENE_IDS
@@ -839,6 +1020,21 @@ def collect_scene(
         for gripper_name, preset_entries in database_archives.items():
             for gripper, preset, archive, archive_path in preset_entries:
                 for yaw in yaw_sweep(gripper):
+                    selected_gripper_map, _ = heightmap.select_yaw_height_map(
+                        archive, float(yaw)
+                    )
+                    finite_gripper_bottom = selected_gripper_map[
+                        np.isfinite(selected_gripper_map)
+                    ]
+                    if finite_gripper_bottom.size == 0:
+                        failures.append(
+                            f"{class_name}/{gripper_name}/{preset.get('name')}/"
+                            f"yaw={yaw:.3f}: selected gripper height map is empty"
+                        )
+                        continue
+                    gripper_lowest_relative_z = float(
+                        np.min(finite_gripper_bottom)
+                    )
                     for candidate_index, candidate in enumerate(candidates):
                         try:
                             record = heightmap.make_pregrasp_record(
@@ -852,6 +1048,7 @@ def collect_scene(
                                 class_name,
                                 gripper,
                             )
+
                             record["scene_index"] = int(scene_id)
                             record["source_scene_id"] = scene_id
                             record["source_heightmap"] = str(archive_path)
@@ -860,6 +1057,7 @@ def collect_scene(
                             record["source_sampled_candidate_count"] = int(len(candidates))
                             record["requested_yaw"] = float(yaw)
                             grasp_bbox = record_grasp_bbox(record, preset)
+                            grasp_bbox_sets = preset_bbox_sets(preset)
                             if DEBUG_VISUALIZE_HEIGHTMAP and (
                                 DEBUG_SCENE_IDS is None or scene_id in DEBUG_SCENE_IDS
                             ):
@@ -875,9 +1073,15 @@ def collect_scene(
                                     safety_margin=SAFETY_MARGIN,
                                 )
                             if ENABLE_BBOX_FILTER or DEBUG_VISUALIZE_BBOX_2D:
+                                gripper_lowest_world_z = (
+                                    float(record["target_points"][2])
+                                    + gripper_lowest_relative_z
+                                )
                                 bbox_passed, bbox_filter_result = hand_bbox_filter_passes(
                                     grasp_bbox,
+                                    grasp_bbox_sets,
                                     scene_point_index,
+                                    gripper_lowest_world_z,
                                 )
                                 if DEBUG_VISUALIZE_BBOX_2D and (
                                     DEBUG_SCENE_IDS is None or scene_id in DEBUG_SCENE_IDS
@@ -902,6 +1106,7 @@ def collect_scene(
                                         bbox_filter_rejected += 1
                                         continue
                             record["grasp_bbox"] = grasp_bbox
+                            record["grasp_bbox_sets"] = grasp_bbox_sets
                             grouped_records.setdefault(gripper_name, []).append(record)
                         except Exception as error:
                             failures.append(
@@ -909,6 +1114,39 @@ def collect_scene(
                                 f"candidate={candidate_index}/yaw={yaw:.3f}: "
                                 f"{type(error).__name__}: {error}"
                             )
+
+    finger_messages: list[str] = []
+    if selected_finger_database:
+        finger_records, finger_messages = finger_sampler.collect_finger_records(
+            selected_finger_database,
+            class_candidates,
+            scene_points,
+            rng,
+            scene_point_index=scene_point_index,
+            yaw_step_deg=FINGER_YAW_STEP_DEG,
+            width_ratios=FINGER_WIDTH_RATIOS,
+            min_depth_gap=FINGER_MIN_DEPTH_GAP,
+            safety_margin=SAFETY_MARGIN,
+        )
+        grouped_records.update(finger_records)
+        for message in finger_messages:
+            print(f"PreGrasp > {message}", flush=True)
+
+    if selected_gripper_name not in grouped_records or not grouped_records[selected_gripper_name]:
+        return {
+            "scene_id": scene_id,
+            "status": "skipped",
+            "reason": f"no pre-grasp records for selected gripper {selected_gripper_name}",
+            "objects": object_count,
+            "records": 0,
+            "selected_gripper_kind": selected_gripper_kind,
+            "selected_gripper_name": selected_gripper_name,
+            "bbox_filter_enabled": ENABLE_BBOX_FILTER,
+            "bbox_filter_evaluated": bbox_filter_evaluated,
+            "bbox_filter_rejected": bbox_filter_rejected,
+            "finger_messages": finger_messages,
+            "failures": failures,
+        }
 
     output_path = DATASET_ROOT / OUTPUT_FOLDER_NAME / f"{scene_id}.json"
     save_grouped_records(output_path, grouped_records)
@@ -919,9 +1157,12 @@ def collect_scene(
         "output": str(output_path),
         "objects": object_count,
         "records": record_count,
+        "selected_gripper_kind": selected_gripper_kind,
+        "selected_gripper_name": selected_gripper_name,
         "bbox_filter_enabled": ENABLE_BBOX_FILTER,
         "bbox_filter_evaluated": bbox_filter_evaluated,
         "bbox_filter_rejected": bbox_filter_rejected,
+        "finger_messages": finger_messages,
         "failures": failures,
     }
 
@@ -937,12 +1178,40 @@ def discover_scene_ids() -> list[str]:
 def main() -> None:
     print("PreGrasp > App_start", flush=True)
     print("PreGrasp > START", flush=True)
-    database = heightmap.load_hand_database(GRIPPER_INFO_PATH)
-    archives = load_heightmap_archives(database)
+    print(
+        "PreGrasp > gripper_selection_mode:"
+        + (
+            "direct_candidates"
+            if FILTER_GRIPPERS_BY_CANDIDATES
+            else "cli_all_grippers_random"
+        ),
+        flush=True,
+    )
+    hand_database = (
+        heightmap.load_hand_database(GRIPPER_INFO_PATH)
+        if ENABLE_HAND_GRIPPERS
+        else {}
+    )
+    if ENABLE_FINGER_GRIPPERS:
+        with open(FINGER_GRIPPER_INFO_PATH, "r", encoding="utf-8") as stream:
+            finger_database = json.load(stream)
+    else:
+        finger_database = {}
+    if not isinstance(finger_database, dict):
+        raise ValueError("Finger gripper database root must be a JSON object")
     rng = np.random.default_rng(RANDOM_SEED)
     summary = {
         "dataset_root": str(DATASET_ROOT),
         "gripper_info_path": str(GRIPPER_INFO_PATH),
+        "finger_gripper_info_path": str(FINGER_GRIPPER_INFO_PATH),
+        "random_gripper_candidates": list(RANDOM_GRIPPER_CANDIDATES),
+        "gripper_selection_mode": (
+            "direct_candidates"
+            if FILTER_GRIPPERS_BY_CANDIDATES
+            else "cli_all_grippers_random"
+        ),
+        "hand_grippers_enabled": ENABLE_HAND_GRIPPERS,
+        "finger_grippers_enabled": ENABLE_FINGER_GRIPPERS,
         "camera_name": CAMERA_NAME,
         "safety_margin": SAFETY_MARGIN,
         "yaw_step_deg": YAW_STEP_DEG,
@@ -950,7 +1219,10 @@ def main() -> None:
         "point_sample_pixel_dist": POINT_SAMPLE_PIXEL_DIST,
         "bbox_filter_enabled": ENABLE_BBOX_FILTER,
         "bbox_filter_min_depth_range": BBOX_FILTER_MIN_DEPTH_RANGE,
-        "bbox_filter_min_pass_count": BBOX_FILTER_MIN_PASS_COUNT,
+        "bbox_filter_min_height_above_gripper_bottom": (
+            BBOX_FILTER_MIN_HEIGHT_ABOVE_GRIPPER_BOTTOM
+        ),
+        "bbox_filter_rule": "all_contact_sets_and__any_bbox_within_set_or",
         "scenes": [],
     }
 
@@ -968,7 +1240,8 @@ def main() -> None:
             print(f"{scene_id}: skipped (existing {output_path})")
             continue
 
-        result = collect_scene(scene_id, archives, rng)
+        result = collect_scene(scene_id, hand_database, finger_database, rng)
+
         summary["scenes"].append(result)
         if result["status"] == "saved":
             print(
@@ -995,22 +1268,31 @@ def main() -> None:
 
 def configure_from_cli(argv: list[str] | None = None) -> None:
     """Apply optional server/CLI overrides while preserving top-level variables."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Hand pre-grasp dataset collector")
     parser.add_argument("--dataset_root", type=Path, default=None)
     parser.add_argument("--output_root_path", type=Path, default=None)
     parser.add_argument("--env_name", type=str, default=None)
     parser.add_argument("--section_name", type=str, default=None)
     parser.add_argument("--platform_name", type=str, default=None)
-    parser.add_argument("--scene_start", type=int, default=None)
+    parser.add_argument(
+        "--scene_start",
+        type=int,
+        default=None,
+        help="Override the top-level SCENE_NUMBER only when explicitly provided.",
+    )
     parser.add_argument("--gripper_info_path", type=Path, default=None)
+    parser.add_argument("--finger_gripper_info_path", type=Path, default=None)
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Regenerate an existing pre_grasp/<scene>.json instead of skipping it.",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
-    global DATASET_ROOT, GRIPPER_INFO_PATH, SCENE_NUMBER, SKIP_EXISTING_PREGRASP
+    global DATASET_ROOT, GRIPPER_INFO_PATH, FINGER_GRIPPER_INFO_PATH
+    global SCENE_NUMBER, SKIP_EXISTING_PREGRASP, FILTER_GRIPPERS_BY_CANDIDATES
+    FILTER_GRIPPERS_BY_CANDIDATES = len(raw_argv) == 0
     if args.dataset_root is not None:
         DATASET_ROOT = args.dataset_root.expanduser().resolve()
     elif args.output_root_path is not None:
@@ -1039,6 +1321,8 @@ def configure_from_cli(argv: list[str] | None = None) -> None:
         SCENE_NUMBER = int(args.scene_start)
     if args.gripper_info_path is not None:
         GRIPPER_INFO_PATH = args.gripper_info_path.expanduser().resolve()
+    if args.finger_gripper_info_path is not None:
+        FINGER_GRIPPER_INFO_PATH = args.finger_gripper_info_path.expanduser().resolve()
     if args.overwrite:
         SKIP_EXISTING_PREGRASP = False
 
