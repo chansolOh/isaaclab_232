@@ -218,7 +218,7 @@ class RobotEnvCfg(DirectRLEnvCfg):
     action_space = 1
     observation_space = 4
     state_space = 0
-    envs = 400
+    envs = 150
     dt = SIM_DT
 
     robot_prim_path = "/World/envs/env_.*/Robot"
