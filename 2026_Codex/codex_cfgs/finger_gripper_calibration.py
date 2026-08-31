@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 
 
@@ -13,7 +12,26 @@ CALIBRATION_KEYS = (
 )
 
 
+def uses_direct_prismatic_width(gripper_info: dict) -> bool:
+    """Return whether width is controlled directly by a prismatic joint.
+
+    The exact ``finger2`` type is the legacy two-finger prismatic mechanism.
+    Other finger types use the polynomial calibration stored in gripper info.
+    """
+    return str(gripper_info.get("type", "")).strip().lower() == "finger2"
+
+
 def validate_calibration(gripper_info: dict) -> None:
+    infer_calibration_joint_names(gripper_info)
+    if uses_direct_prismatic_width(gripper_info):
+        for key in ("open_joint_deg", "close_joint_deg"):
+            if key not in gripper_info:
+                raise KeyError(
+                    f"{gripper_info.get('gripper_name', '<unnamed>')} requires {key} "
+                    "for direct prismatic control"
+                )
+        return
+
     invalid = [
         key
         for key in CALIBRATION_KEYS
@@ -35,90 +53,21 @@ def evaluate_polynomial(coefficients: Iterable[float], value):
     return result
 
 
-def _explicit_joint_names(gripper_info: dict) -> list[str] | None:
-    names = gripper_info.get("calibration_joint_names")
-    if names is None:
-        return None
-    if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
-        raise ValueError("calibration_joint_names must be a non-empty string list")
-    return names
-
-
 def infer_calibration_joint_names(gripper_info: dict) -> list[str]:
-    """Find the physical closing joints, excluding legacy lift/z-hop helpers.
-
-    Ambiguous future grippers can provide ``calibration_joint_names`` in the
-    JSON.  The current Robotiq_2f140 is inferred as its two finger joints.
-    """
-    explicit = _explicit_joint_names(gripper_info)
+    """Return the single actuator joint whose USD mimic drives all fingers."""
     joint_names = list(gripper_info.get("joint_cfg", {}))
-    if explicit is not None:
-        missing = [name for name in explicit if name not in joint_names]
-        if missing:
-            raise KeyError(f"calibration_joint_names not found in joint_cfg: {missing}")
-        return explicit
-
-    candidates = [
-        name
-        for name in joint_names
-        if "lift" not in name.lower() and "z_hop" not in name.lower()
-    ]
-    family = str(gripper_info.get("type", "")).lower()
-    expected = 2 if family.startswith("finger2") else 3 if family.startswith("finger3") else 0
-    if expected == 0:
+    family = str(gripper_info.get("type", "")).strip().lower()
+    if not family.startswith(("finger2", "finger3")):
         raise ValueError(f"Unsupported calibrated gripper type: {family!r}")
-    if len(candidates) == expected:
-        return candidates
-
-    if expected == 2:
-        direct = [
-            name for name in candidates
-            if re.fullmatch(r"(?:left|right)_joint", name, flags=re.IGNORECASE)
-        ]
-        if len(direct) == expected:
-            return direct
-    else:
-        direct = [
-            name for name in candidates
-            if re.fullmatch(r"f[0-2]_joint", name, flags=re.IGNORECASE)
-        ]
-        if len(direct) == expected:
-            return sorted(direct)
-
-    raise ValueError(
-        f"Cannot infer {expected} calibration joints from {joint_names}. "
-        "Add calibration_joint_names to this gripper entry."
-    )
+    if len(joint_names) != 1:
+        raise ValueError(
+            f"{gripper_info.get('gripper_name', '<unnamed>')} must define exactly "
+            f"one mimic actuator joint in joint_cfg; found {joint_names}"
+        )
+    return joint_names
 
 
 def close_joint_degrees(gripper_info: dict, joint_names: list[str]) -> list[float]:
-    family = str(gripper_info.get("type", "")).lower()
-    if family.startswith("finger2"):
-        right = float(gripper_info["close_r_joint"])
-        left = float(gripper_info["close_l_joint"])
-        values = []
-        for index, name in enumerate(joint_names):
-            lowered = name.lower()
-            values.append(left if "left" in lowered else right if "right" in lowered else (right, left)[index])
-        return values
-    if family.startswith("finger3"):
-        closes = [
-            float(gripper_info[f"close_f{finger}_joint"])
-            for finger in range(3)
-        ]
-        values = []
-        for index, name in enumerate(joint_names):
-            match = re.search(r"f([0-2])", name.lower())
-            values.append(closes[int(match.group(1))] if match else closes[index])
-        return values
-    raise ValueError(f"Unsupported calibrated gripper type: {family!r}")
-
-
-def signed_joint_degrees(gripper_info: dict, joint_names: list[str], magnitude):
-    """Apply each physical closing joint's sign to a calibrated magnitude."""
-    closes = close_joint_degrees(gripper_info, joint_names)
-    values = []
-    for close in closes:
-        sign = -1.0 if close < 0.0 else 1.0
-        values.append(magnitude * sign)
-    return values
+    if uses_direct_prismatic_width(gripper_info):
+        raise ValueError("Direct prismatic joint values are metres, not degrees")
+    return [float(gripper_info["close_joint_deg"])] * len(joint_names)

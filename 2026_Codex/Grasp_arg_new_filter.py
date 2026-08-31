@@ -14,7 +14,7 @@ parser.add_argument(
 parser.add_argument("--env_name", default="Home", type=str)
 parser.add_argument("--section_name", default="MasterBedroom", type=str)
 parser.add_argument("--platform_name", default="sideboard_01", type=str)
-parser.add_argument("--scene_start", default=1, type=int)
+parser.add_argument("--scene_start", default=62, type=int)
 parser.add_argument("--pre_grasp_index", default=0, type=int, help=argparse.SUPPRESS)
 args = parser.parse_args()
 root_path = os.path.join(
@@ -26,7 +26,7 @@ root_path = os.path.join(
 
 # Isaac Lab's launcher owns the remaining CLI parsing, matching Grasp_arg.py.
 sys.argv = [sys.argv[0]]
-
+ 
 import Direct_RL_main_new_filter as DRm
 
 DRm.main(

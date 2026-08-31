@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 
 import numpy as np
 import torch
@@ -22,8 +23,7 @@ from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_euler_an
 from .finger_gripper_calibration import (
     close_joint_degrees,
     evaluate_polynomial,
-    infer_calibration_joint_names,
-    signed_joint_degrees,
+    uses_direct_prismatic_width,
     validate_calibration,
 )
 
@@ -41,14 +41,20 @@ class FingerActionPolicy:
         step_dt,
         device,
         contact_sensor,
+        contact_sensor_rows_by_env,
         frame_transformer,
         env_origin,
         debug=False,
+        width_command_duration_sec=0.25,
+        width_ready_timeout_sec=1.0,
+        width_ready_revolute_error_rad=math.radians(2.0),
+        width_ready_prismatic_error_m=0.001,
         approach_duration_sec=0.35,
-        approach_height=0.08,
+        approach_height=0.10,
         close_timeout_sec=1.5,
-        platform_drop_duration_sec=0.8,
-        platform_drop_height=0.20,
+        platform_drop_height=0.70,
+        target_drop_failure_distance=0.20,
+        platform_settle_duration_sec=1.0,
     ):
         self.env_num = int(env_num)
         self.pre_grasp_data = pre_grasp_data
@@ -63,10 +69,13 @@ class FingerActionPolicy:
         self.step_dt = float(step_dt)
         self.device = device
         self.contact_sensor = contact_sensor
+        self.contact_sensor_rows_by_env = contact_sensor_rows_by_env
         self.frame_transformer = frame_transformer
         self.env_origin = env_origin
         self.debug = bool(debug)
+        self.width_debug = os.environ.get("FINGER_WIDTH_DEBUG", "0") == "1"
 
+        self.direct_prismatic_width = uses_direct_prismatic_width(gripper_info)
         validate_calibration(gripper_info)
         if "total_length" not in gripper_info:
             raise KeyError(
@@ -75,34 +84,49 @@ class FingerActionPolicy:
         self.total_length = float(gripper_info["total_length"])
         self.gripper_height = float(gripper_info["height"])
         self.max_width = float(gripper_info["width"])
-        self.calibration_joint_names = infer_calibration_joint_names(gripper_info)
-        joint_name_to_policy_index = {name: index for index, name in enumerate(self.joint_names)}
+        # joint_cfg contains the one actuator joint whose USD mimic relation
+        # drives the remaining physical finger joints.
+        self.calibration_joint_names = list(self.joint_names)
+        if len(self.calibration_joint_names) != 1:
+            raise ValueError(
+                "FingerActionPolicy requires exactly one mimic actuator joint; "
+                f"got {self.calibration_joint_names}"
+            )
         self.calibration_policy_indices = torch.tensor(
-            [joint_name_to_policy_index[name] for name in self.calibration_joint_names],
+            [0],
             dtype=torch.long,
-            device=device,
-        )
-        close_degrees = close_joint_degrees(gripper_info, self.calibration_joint_names)
-        self.calibration_signs = torch.tensor(
-            [-1.0 if value < 0.0 else 1.0 for value in close_degrees],
-            dtype=torch.float,
             device=device,
         )
 
         self.approach_steps = max(1, int(round(approach_duration_sec / self.step_dt)))
         self.approach_height = float(approach_height)
+        self.width_command_steps = max(
+            1, int(round(width_command_duration_sec / self.step_dt))
+        )
+        self.width_ready_timeout_steps = max(
+            self.width_command_steps,
+            int(round(width_ready_timeout_sec / self.step_dt)),
+        )
+        self.width_ready_error = float(
+            width_ready_prismatic_error_m
+            if self.direct_prismatic_width
+            else width_ready_revolute_error_rad
+        )
         self.close_timeout_steps = max(1, int(round(close_timeout_sec / self.step_dt)))
         self.close_min_steps = max(3, int(round(0.08 / self.step_dt)))
-        self.platform_drop_steps = max(
-            1, int(round(platform_drop_duration_sec / self.step_dt))
+        self.platform_settle_steps = max(
+            1, int(round(platform_settle_duration_sec / self.step_dt))
         )
         self.platform_drop_height = float(platform_drop_height)
+        self.target_drop_failure_distance = float(target_drop_failure_distance)
+        if self.platform_drop_height <= 0.0:
+            raise ValueError("platform_drop_height must be positive")
+        if self.target_drop_failure_distance <= 0.0:
+            raise ValueError("target_drop_failure_distance must be positive")
         self.grasp_blocked_error = 0.005
         self.grasp_stall_delta = 0.0002
         self.grasp_stall_count_threshold = 5
         self.lift_success_threshold = 0.02
-        self.early_fail_check_drop = max(0.01, self.platform_drop_height * 0.25)
-        self.early_fail_height_threshold = self.lift_success_threshold * 0.5
 
         self.total_grasp_num = len(pre_grasp_data)
         self.current_grasp_num = 0
@@ -129,6 +153,10 @@ class FingerActionPolicy:
         )
         self.open_joint = torch.zeros_like(self.target_joint)
         self.close_joint = torch.zeros_like(self.target_joint)
+        self.approach_start_joint = torch.zeros_like(self.target_joint)
+        self.width_ready = torch.zeros(
+            self.env_num, dtype=torch.bool, device=device
+        )
         self.root_pose = torch.zeros((self.env_num, 7), dtype=torch.float, device=device)
         self.root_pose[:, 3] = 1.0
         self.base_position = torch.zeros((self.env_num, 3), dtype=torch.float, device=device)
@@ -202,15 +230,35 @@ class FingerActionPolicy:
         return torch.tensor(values, dtype=torch.float, device=self.device).repeat(count, 1)
 
     def _calibrated_open_joint(self, widths: torch.Tensor) -> torch.Tensor:
-        magnitude_deg = evaluate_polynomial(
+        joint_count = len(self.calibration_joint_names)
+        if self.direct_prismatic_width:
+            # Legacy finger2: target_width is the full gap, while the single
+            # master prismatic joint moves one side and its USD mimic moves the
+            # other. This is the previous close +/- width/2 relationship.
+            close = float(self.gripper_info["close_joint_deg"])
+            opened = float(self.gripper_info["open_joint_deg"])
+            direction = 1.0 if opened >= close else -1.0
+            return (close + direction * widths[:, None] * 0.5).repeat(
+                1, joint_count
+            )
+
+        # Polynomial output is already the signed physical joint angle. Do not
+        # apply the close direction a second time.
+        joint_degrees = evaluate_polynomial(
             self.gripper_info["width_to_joint_coeffs"], widths
         )
-        signed = signed_joint_degrees(
-            self.gripper_info, self.calibration_joint_names, magnitude_deg
+        return joint_degrees[:, None].repeat(1, joint_count) * (
+            math.pi / 180.0
         )
-        return torch.stack(signed, dim=1) * (math.pi / 180.0)
 
     def _calibrated_close_joint(self, count: int) -> torch.Tensor:
+        if self.direct_prismatic_width:
+            return torch.full(
+                (count, len(self.calibration_joint_names)),
+                float(self.gripper_info["close_joint_deg"]),
+                dtype=torch.float,
+                device=self.device,
+            )
         degrees = close_joint_degrees(
             self.gripper_info, self.calibration_joint_names
         )
@@ -219,11 +267,16 @@ class FingerActionPolicy:
         )
 
     def _joint_z(self, policy_joint_positions: torch.Tensor) -> torch.Tensor:
-        primary = policy_joint_positions[:, self.calibration_policy_indices]
-        magnitude_deg = (primary * self.calibration_signs[None, :]).mean(dim=1) * (
-            180.0 / math.pi
+        if self.direct_prismatic_width:
+            return torch.zeros(
+                policy_joint_positions.shape[0],
+                dtype=policy_joint_positions.dtype,
+                device=policy_joint_positions.device,
+            )
+        joint_degrees = policy_joint_positions[:, 0] * (180.0 / math.pi)
+        return evaluate_polynomial(
+            self.gripper_info["joint_to_z_coeffs"], joint_degrees
         )
-        return evaluate_polynomial(self.gripper_info["joint_to_z_coeffs"], magnitude_deg)
 
     def _set_disabled(self, env_ids: torch.Tensor) -> None:
         if len(env_ids) == 0:
@@ -238,6 +291,7 @@ class FingerActionPolicy:
     def reset(self, env_ids) -> None:
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         remaining = self.total_grasp_num - self.current_grasp_num
+
         if remaining <= 0:
             self._set_disabled(env_ids)
             self._refresh_pregrasp_points()
@@ -263,6 +317,7 @@ class FingerActionPolicy:
         self.close_error_previous[active_envs] = 0.0
         self.close_error_valid[active_envs] = False
         self.close_stall_count[active_envs] = 0
+        self.width_ready[active_envs] = False
 
         self.base_position[active_envs] = self.total_base_position[source_ids]
         self.base_quaternion[active_envs] = self.total_base_quaternion[source_ids]
@@ -282,7 +337,12 @@ class FingerActionPolicy:
         )
         self.open_joint[active_envs] = open_joint
         self.close_joint[active_envs] = close_joint
-        self.target_joint[active_envs] = open_joint
+        approach_start_joint = self._initial_joint_vector(active_count)
+        self.approach_start_joint[active_envs] = approach_start_joint
+        # Keep the USD mimic chain at its mutually consistent default pose
+        # during reset. Stage 0 smoothly moves its sole actuator joint to the
+        # requested opening instead of teleporting it.
+        self.target_joint[active_envs] = approach_start_joint
         self.open_z[active_envs] = self._joint_z(open_joint)
 
         # ``joint_to_z`` is the increase in gripper length from the fully-open
@@ -317,11 +377,85 @@ class FingerActionPolicy:
         active = self.action_enable == 1
         stage0 = torch.where(active & (self.stage_num == 0))[0]
         if len(stage0):
+            width_preparing = stage0[~self.width_ready[stage0]]
+            if len(width_preparing):
+                progress = (
+                    (self.stage_step[width_preparing] + 1).float()
+                    / self.width_command_steps
+                ).clamp(0.0, 1.0)
+                smooth = progress * progress * (3.0 - 2.0 * progress)
+                # Hold the root at the safe approach height while opening to
+                # the candidate width. Only the master joint is commanded;
+                # the rest of the chain follows through USD mimic constraints.
+                self.root_pose[width_preparing, :3] = self.base_position[
+                    width_preparing
+                ]
+                self.root_pose[width_preparing, 2] += self.approach_height
+                self.root_pose[width_preparing, 3:7] = self.base_quaternion[
+                    width_preparing
+                ]
+                self.target_joint[width_preparing] = (
+                    self.approach_start_joint[width_preparing]
+                    + (
+                        self.open_joint[width_preparing]
+                        - self.approach_start_joint[width_preparing]
+                    )
+                    * smooth[:, None]
+                )
+                self.joint_command_dirty[width_preparing] = True
+                self.stage_step[width_preparing] += 1
+
+                current = self.joint_pos[width_preparing][:, self.joint_index]
+
+                error = torch.linalg.vector_norm(
+                    self.open_joint[width_preparing] - current, dim=1
+                )
+                if self.width_debug and len(width_preparing):
+                    env_id = int(width_preparing[0])
+                    if int(self.stage_step[env_id]) % 10 == 0:
+                        print(
+                            "FingerActionPolicy > width_debug "
+                            f"env={env_id} source={int(self.assigned_pregrasp[env_id])} "
+                            f"width={float(self.target_width[env_id]):.6f} "
+                            f"step={int(self.stage_step[env_id])} "
+                            f"command={self.target_joint[env_id].detach().cpu().tolist()} "
+                            f"current={current[0].detach().cpu().tolist()} "
+                            f"error={float(error[0]):.6f}"
+                        )
+                command_finished = (
+                    self.stage_step[width_preparing] >= self.width_command_steps
+                )
+                reached = command_finished & (error <= self.width_ready_error)
+                timed_out = (
+                    self.stage_step[width_preparing]
+                    >= self.width_ready_timeout_steps
+                )
+
+                ready_envs = width_preparing[reached]
+                if len(ready_envs):
+                    self.width_ready[ready_envs] = True
+                    self.stage_step[ready_envs] = 0
+                    self.target_joint[ready_envs] = self.open_joint[ready_envs]
+                    self.joint_command_dirty[ready_envs] = True
+
+                failed_envs = width_preparing[timed_out & ~reached]
+                if len(failed_envs):
+                    self.grasp_fail_idx[failed_envs] = True
+                    self.stage_num[failed_envs] = 3
+                    self.stage_step[failed_envs] = 0
+
+        # Z descent begins only after the actual master joint is sufficiently
+        # close to the requested opening width.
+        stage0 = torch.where(
+            active & (self.stage_num == 0) & self.width_ready
+        )[0]
+        if len(stage0):
             progress = ((self.stage_step[stage0] + 1).float() / self.approach_steps).clamp(0.0, 1.0)
             smooth = progress * progress * (3.0 - 2.0 * progress)
             self.root_pose[stage0, :3] = self.base_position[stage0]
             self.root_pose[stage0, 2] += self.approach_height * (1.0 - smooth)
             self.root_pose[stage0, 3:7] = self.base_quaternion[stage0]
+            self.target_joint[stage0] = self.open_joint[stage0]
             self.stage_step[stage0] += 1
             done = stage0[self.stage_step[stage0] >= self.approach_steps]
             if len(done):
@@ -347,10 +481,14 @@ class FingerActionPolicy:
             self.root_pose[stage2, :3] = self.base_position[stage2]
             self.root_pose[stage2, 2] += z_hop
             self.root_pose[stage2, 3:7] = self.base_quaternion[stage2]
-            progress = ((self.stage_step[stage2] + 1).float() / self.platform_drop_steps).clamp(0.0, 1.0)
-            self.platform_drop_offset[stage2] = -self.platform_drop_height * progress
+            # Keep the closed gripper fixed and move the support platform down
+            # by the full configured distance immediately. The remaining stage
+            # steps are only a settling/evaluation wait.
+            self.platform_drop_offset[stage2] = -self.platform_drop_height
             self.stage_step[stage2] += 1
-            done = stage2[self.stage_step[stage2] >= self.platform_drop_steps]
+            done = stage2[
+                self.stage_step[stage2] >= self.platform_settle_steps
+            ]
             if len(done):
                 self.stage_num[done] = 3
                 self.stage_step[done] = 0
@@ -372,9 +510,8 @@ class FingerActionPolicy:
         if len(idx) == 0:
             return done
         current = self.joint_pos[idx][:, self.joint_index]
-        primary = self.calibration_policy_indices
         error = torch.linalg.vector_norm(
-            self.close_joint[idx][:, primary] - current[:, primary], dim=1
+            self.close_joint[idx] - current, dim=1
         )
         delta = torch.abs(error - self.close_error_previous[idx])
         stalled = self.close_error_valid[idx] & (delta < self.grasp_stall_delta) & (
@@ -416,14 +553,57 @@ class FingerActionPolicy:
         if len(idx) == 0:
             return done
 
-        history = self.contact_sensor.data.net_forces_w_history[idx]
-        peak_contact = torch.amax(history.abs(), dim=1).sum(dim=(1, 2))
+        sensor_rows = self.contact_sensor_rows_by_env[idx]
+        history = self.contact_sensor.data.net_forces_w_history[sensor_rows]
+        # Shape: (logical env, wildcard parent, history, body, xyz). Any one
+        # finger contact contributes to the environment-level contact total.
+        peak_contact = torch.amax(history.abs(), dim=2).sum(dim=(1, 2, 3))
         failed = idx[peak_contact < 0.2]
         if len(failed):
             self.grasp_fail_idx[failed] = True
             self.stage_num[failed] = 3
             self.stage_step[failed] = 0
             done[failed] = True
+        return done
+
+    def _mark_target_drop_failures(self) -> torch.Tensor:
+        """Fail immediately if the target falls far below its initial world Z."""
+        done = torch.zeros(self.env_num, dtype=torch.bool, device=self.device)
+        idx = torch.where(
+            (self.action_enable == 1)
+            & ((self.stage_num == 2) | (self.stage_num == 3))
+            & ~self.recorded
+            & ~self.grasp_fail_idx
+        )[0]
+        if len(idx) == 0:
+            return done
+
+        object_positions = self.frame_transformer.data.target_pos_source[idx]
+        target_positions = object_positions[
+            torch.arange(len(idx), device=self.device), self.target_class[idx]
+        ]
+        original_target_z = self.object_pos_org[self.target_class[idx], 2]
+        drop_distance = original_target_z - target_positions[:, 2]
+        failed = drop_distance >= self.target_drop_failure_distance
+        failed_envs = idx[failed]
+        if len(failed_envs) == 0:
+            return done
+
+        self.grasp_fail_idx[failed_envs] = True
+        self.stage_num[failed_envs] = 3
+        self.stage_step[failed_envs] = 0
+        done[failed_envs] = True
+        if self.debug:
+            for local_index, env_id in zip(
+                torch.where(failed)[0].detach().cpu().tolist(),
+                failed_envs.detach().cpu().tolist(),
+            ):
+                print(
+                    "FingerActionPolicy > target_dropped "
+                    f"env={env_id} "
+                    f"drop_distance={float(drop_distance[local_index]):.5f} "
+                    f"threshold={self.target_drop_failure_distance:.5f}"
+                )
         return done
 
     def _grasp_bboxes_world(self, env_ids: torch.Tensor) -> torch.Tensor:
@@ -630,6 +810,7 @@ class FingerActionPolicy:
 
     def get_done_idx(self) -> torch.Tensor:
         done = self._advance_closing()
+        done |= self._mark_target_drop_failures()
         done |= self._mark_contact_failures()
         evaluate = torch.where(
             (self.action_enable == 1)

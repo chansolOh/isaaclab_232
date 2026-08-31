@@ -16,6 +16,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.sensors import ContactSensor
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
@@ -50,50 +51,93 @@ EMPTY_HAND_ENV_CFG = ArticulationCfg(
 )
 
 
-def _contact_sensor_relative_pattern(gripper_info: dict, pre_grasp_data: list) -> str:
-    """Build one exact ContactSensorCfg pattern for all configured fingertips."""
+class EnvGroupedContactSensor(ContactSensor):
+    """Group nested wildcard sensor parents back into their IsaacLab envs.
+
+    A pattern such as ``env_.*/Robot/.../F.*/finger`` makes the stock contact
+    sensor treat every F parent as a separate environment.  PhysX therefore
+    exposes ``num_envs * fingers`` rows with one body each.  This class keeps
+    that valid PhysX view while recording which physical rows belong to each
+    logical ``env_N`` and expands reset indices accordingly.
+    """
+
+    _ENV_PATH_PATTERN = re.compile(r"/env_(\d+)(?:/|$)")
+
+    def _initialize_impl(self):
+        super()._initialize_impl()
+        rows_by_env: dict[int, list[int]] = {}
+        for row, prim in enumerate(self._parent_prims):
+            match = self._ENV_PATH_PATTERN.search(prim.GetPath().pathString)
+            if match is None:
+                continue
+            rows_by_env.setdefault(int(match.group(1)), []).append(row)
+
+        if not rows_by_env:
+            # Standalone assets do not have an env_N namespace. Preserve the
+            # stock interpretation for diagnostic scripts.
+            self._logical_env_rows = torch.arange(
+                self._num_envs, dtype=torch.long, device=self._device
+            )[:, None]
+            return
+
+        logical_env_ids = sorted(rows_by_env)
+        if logical_env_ids != list(range(len(logical_env_ids))):
+            raise RuntimeError(
+                "Contact sensor env namespaces must be contiguous from env_0; "
+                f"found {logical_env_ids}"
+            )
+        row_counts = {len(rows_by_env[env_id]) for env_id in logical_env_ids}
+        if len(row_counts) != 1:
+            raise RuntimeError(
+                "Every logical environment must have the same number of contact "
+                f"sensor parents; found {[len(rows_by_env[i]) for i in logical_env_ids]}"
+            )
+        self._logical_env_rows = torch.tensor(
+            [rows_by_env[env_id] for env_id in logical_env_ids],
+            dtype=torch.long,
+            device=self._device,
+        )
+        print(
+            "Contact sensor grouping: "
+            f"logical_envs={len(logical_env_ids)} "
+            f"rows_per_env={self._logical_env_rows.shape[1]} "
+            f"physical_rows={self._num_envs} "
+            f"bodies_per_row={self.num_bodies}"
+        )
+
+    @property
+    def logical_env_rows(self) -> torch.Tensor:
+        return self._logical_env_rows
+
+    def reset(self, env_ids: Sequence[int] | None = None):
+        if env_ids is None or not hasattr(self, "_logical_env_rows"):
+            return super().reset(env_ids)
+        logical_ids = torch.as_tensor(
+            env_ids, dtype=torch.long, device=self._logical_env_rows.device
+        )
+        physical_rows = self._logical_env_rows[logical_ids].reshape(-1)
+        return super().reset(physical_rows)
+
+
+def _contact_sensor_relative_pattern(gripper_info: dict) -> str:
+    """Build one ContactSensorCfg pattern from the hand gripper-info paths."""
+    configured_paths = gripper_info.get("contact_sensor_paths")
+    if not isinstance(configured_paths, list) or not configured_paths:
+        raise KeyError(
+            f"{gripper_info.get('gripper_name')} needs non-empty "
+            "contact_sensor_paths in the hand gripper info JSON"
+        )
+
     sensor_paths: list[str] = []
-    for record in pre_grasp_data:
-        sensor_sets = record.get("contact_sensor_sets", {})
-        if not isinstance(sensor_sets, dict):
-            continue
-        for paths in sensor_sets.values():
-            if not isinstance(paths, list):
-                continue
-            for path in paths:
-                if isinstance(path, str) and path.startswith("/") and path not in sensor_paths:
-                    sensor_paths.append(path)
-
-    # Always include every contact-reporter body explicitly configured for the
-    # hand, even when a particular preset uses only a subset of fingertips.
-    for path in gripper_info.get("contact_sensor_paths", []):
-        if isinstance(path, str) and path.startswith("/") and path not in sensor_paths:
-            sensor_paths.append(path)
-
-    if not sensor_paths:
-        # Compatibility for an old database before contact_sensor_paths were
-        # persisted. Selected fingertip mesh prims are normally direct children
-        # of their rigid link.
-        for preset in gripper_info.get("preset", []):
-            if not isinstance(preset, dict):
-                continue
-            fingertips = preset.get("fingertip_points", {})
-            if not isinstance(fingertips, dict):
-                continue
-            for fingertip in fingertips.values():
-                if not isinstance(fingertip, dict):
-                    continue
-                mesh_path = fingertip.get("mesh_path")
-                if not isinstance(mesh_path, str) or not mesh_path.startswith("/"):
-                    continue
-                stripped = mesh_path.rstrip("/")
-                path = stripped.rsplit("/", 1)[0] if "/" in stripped[1:] else stripped
-                if path not in sensor_paths:
-                    sensor_paths.append(path)
-
-    if not sensor_paths:
-        # Generic legacy fallback. New presets should always take an exact path.
-        return ".*"
+    for path in configured_paths:
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(
+                f"Invalid contact sensor path for {gripper_info.get('gripper_name')}: "
+                f"{path!r}"
+            )
+        normalized = "/" + path.strip().strip("/")
+        if normalized not in sensor_paths:
+            sensor_paths.append(normalized)
 
     relative_paths = [path.strip("/") for path in sensor_paths]
     parent_paths = {posixpath.dirname(path) for path in relative_paths}
@@ -156,9 +200,7 @@ def Set_RobotEnvCFG(envcfg, gripper_info, pre_grasp_data):
     envcfg.robot_cfg.actuators = actuators
     envcfg.joint_names = list(joint_cfg)
     envcfg.gripper_info = gripper_info
-    envcfg.contact_sensor_prim_path = _contact_sensor_relative_pattern(
-        gripper_info, pre_grasp_data
-    )
+    envcfg.contact_sensor_prim_path = _contact_sensor_relative_pattern(gripper_info)
     envcfg.scene.contact_sensor.prim_path = (
         f"{envcfg.robot_prim_path}/{envcfg.contact_sensor_prim_path}"
     )
@@ -180,7 +222,6 @@ class RobotEnvCfg(DirectRLEnvCfg):
     dt = SIM_DT
 
     robot_prim_path = "/World/envs/env_.*/Robot"
-    contact_sensor_prim_path = "right_hand_.*"
     root_max_linear_speed = 0.5
     root_max_angular_speed = math.radians(180.0)
     z_compliance_force_threshold = 1.0
@@ -224,9 +265,6 @@ class RobotEnvCfg(DirectRLEnvCfg):
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
-    scene.contact_sensor.prim_path = (
-        f"{robot_prim_path}/{contact_sensor_prim_path}"
-    )
     scene.contact_sensor.debug_vis = False
 
 
@@ -260,6 +298,17 @@ class RobotEnv(DirectRLEnv):
             dtype=torch.long,
             device=self.device,
         )
+        mimic_reset_joint_names = list(
+            getattr(self.cfg, "mimic_reset_joint_names", [])
+        )
+        self._mimic_reset_joint_indexes = torch.tensor(
+            [
+                self.robot.find_joints(name)[0][0]
+                for name in mimic_reset_joint_names
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
         self._apply_passive_joint_effort_limit()
         self._print_hand_joint_limits_once()
         self.joint_pos = self.robot.data.joint_pos
@@ -267,6 +316,7 @@ class RobotEnv(DirectRLEnv):
         self.pre_grasp_data = [] if pre_grasp_data is None else pre_grasp_data
         self.conf_data = {} if conf_data is None else conf_data
         self.debug = debug
+        self._contact_sensor_rows_by_env = self._resolve_contact_sensor_rows_by_env()
         self.act_pol = self._make_action_policy()
         self._last_root_pose_command = self.robot.data.default_root_state[:, :7].clone()
         self._last_root_pose_command[:, :3] += self.scene.env_origins
@@ -327,6 +377,24 @@ class RobotEnv(DirectRLEnv):
                 f"stiffness={float(stiffness[joint_id]):.6g}, "
                 f"damping={float(damping[joint_id]):.6g}"
             )
+
+    def _resolve_contact_sensor_rows_by_env(self) -> torch.Tensor:
+        rows = getattr(self.contact_sensor, "logical_env_rows", None)
+        if rows is None:
+            if self.contact_sensor._num_envs != self.num_envs:
+                raise RuntimeError(
+                    "Contact sensor physical rows do not match logical environments: "
+                    f"sensor={self.contact_sensor._num_envs}, env={self.num_envs}"
+                )
+            rows = torch.arange(
+                self.num_envs, dtype=torch.long, device=self.device
+            )[:, None]
+        if rows.shape[0] != self.num_envs:
+            raise RuntimeError(
+                "Contact sensor grouping does not match the environment count: "
+                f"rows={tuple(rows.shape)}, env={self.num_envs}"
+            )
+        return rows
 
     def _make_action_policy(self):
         return HandActionPolicy(
@@ -440,6 +508,12 @@ class RobotEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         del actions
+        # ArticulationData replaces its cached joint-position tensor whenever
+        # it refreshes from PhysX.  Keep the policy reference synchronized so
+        # width-ready and closing checks use the current master joint rather
+        # than the tensor captured when the policy was constructed.
+        self.joint_pos = self.robot.data.joint_pos
+        self.act_pol.joint_pos = self.joint_pos
         self.actions = self.act_pol.step()
 
     @staticmethod
@@ -495,7 +569,9 @@ class RobotEnv(DirectRLEnv):
         if not hasattr(self.contact_sensor.data, "net_forces_w"):
             return desired_pose
 
-        force_z = self.contact_sensor.data.net_forces_w[env_ids, :, 2].clamp_min(0.0).sum(dim=1)
+        sensor_rows = self._contact_sensor_rows_by_env[env_ids]
+        forces = self.contact_sensor.data.net_forces_w[sensor_rows]
+        force_z = forces[..., 2].clamp_min(0.0).sum(dim=(1, 2))
         force_alpha = (
             float(self.step_dt)
             / max(float(self.step_dt), float(self.cfg.z_compliance_force_filter))
@@ -563,6 +639,7 @@ class RobotEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self.joint_pos = self.robot.data.joint_pos
+        self.act_pol.joint_pos = self.joint_pos
         time_out = self.episode_length_buf >= 1000 - 1
         return self.act_pol.get_done_idx(), time_out
 
@@ -587,6 +664,19 @@ class RobotEnv(DirectRLEnv):
             joint_pos[
                 assigned_rows[:, None], self._joint_indexes[None, :]
             ] = self.act_pol.target_joint[assigned_envs]
+            if len(self._mimic_reset_joint_indexes):
+                # A mimic follower has no drive target of its own, but writing
+                # the full articulation reset state with its default value can
+                # violate the mimic constraint before the first physics step.
+                # Initialize it consistently with the master START-width pose;
+                # subsequent commands still target only the selected master.
+                master_start = self.act_pol.target_joint[assigned_envs, :1]
+                joint_pos[
+                    assigned_rows[:, None],
+                    self._mimic_reset_joint_indexes[None, :],
+                ] = master_start.expand(
+                    -1, len(self._mimic_reset_joint_indexes)
+                )
         joint_vel = torch.zeros_like(self.robot.data.default_joint_vel[env_ids])
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)

@@ -17,6 +17,7 @@ from isaaclab.utils import configclass
 from cfgs import scene_cfg as SC
 from .Robot_EnvCfg_hand_platform_filter import RobotEnv as _PlatformRobotEnv
 from .Robot_EnvCfg_hand_platform_filter import RobotEnvCfg as _PlatformRobotEnvCfg
+from .Robot_EnvCfg_hand_platform_filter import EnvGroupedContactSensor
 from .action_policy_finger_new import FingerActionPolicy
 from .finger_gripper_calibration import (
     infer_calibration_joint_names,
@@ -40,7 +41,10 @@ EMPTY_FINGER_ENV_CFG = ArticulationCfg(
             max_depenetration_velocity=5.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            fix_root_link=False,
+            # A fixed-base articulation can still be repositioned through
+            # write_root_pose_to_sim. Keeping the root fixed prevents internal
+            # finger-drive reaction torque from rotating the gripper body.
+            fix_root_link=True,
             enabled_self_collisions=False,
             solver_position_iteration_count=ARTICULATION_POSITION_ITERATION_COUNT,
             solver_velocity_iteration_count=ARTICULATION_VELOCITY_ITERATION_COUNT,
@@ -81,7 +85,6 @@ def Set_RobotEnvCFG(envcfg, gripper_info):
             stiffness=_optional_number(cfg.get("stiffness")),
             damping=_optional_number(cfg.get("damping")),
         )
-
     envcfg.robot_cfg.spawn.usd_path = gripper_info["usd_path"]
     envcfg.robot_cfg.init_state.joint_pos = {
         name: float(value)
@@ -89,23 +92,32 @@ def Set_RobotEnvCFG(envcfg, gripper_info):
     }
     envcfg.robot_cfg.actuators = actuators
     envcfg.joint_names = controlled_names
+    envcfg.mimic_reset_joint_names = []
     envcfg.gripper_info = gripper_info
-    envcfg.contact_sensor_prim_path = gripper_info.get(
-        "contact_sensor_prim_path",
-        f"{gripper_info['gripper_name']}/.*[Ff]inger.*",
-    )
+    print(f"Finger control mode: mimic; controlled={controlled_names}")
+    contact_sensor_prim_path = str(
+        gripper_info.get("contact_sensor_prim_path", "")
+    ).strip()
+    if not contact_sensor_prim_path:
+        raise KeyError(
+            f"{gripper_info.get('gripper_name')} needs contact_sensor_prim_path "
+            "in the gripper info JSON"
+        )
+
+    # The JSON stores a path relative to the per-environment Robot prim.
+    envcfg.contact_sensor_prim_path = contact_sensor_prim_path.strip("/")
     envcfg.scene.contact_sensor.prim_path = (
         f"{envcfg.robot_prim_path}/{envcfg.contact_sensor_prim_path}"
     )
+    envcfg.scene.contact_sensor.class_type = EnvGroupedContactSensor
     configure_scene_object_rigid_props(envcfg.scene)
 
 
 @configclass
 class RobotEnvCfg(_PlatformRobotEnvCfg):
-    envs = 200
+    envs = 400
     dt = SIM_DT
     robot_prim_path = "/World/envs/env_.*/Robot"
-    contact_sensor_prim_path = "Robotiq_2f140/.*[Ff]inger.*"
     filter_robot_platform_collision = True
 
     sim: SimulationCfg = make_grasp_simulation_cfg()
@@ -133,9 +145,6 @@ class RobotEnvCfg(_PlatformRobotEnvCfg):
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
-    scene.contact_sensor.prim_path = (
-        f"{robot_prim_path}/{contact_sensor_prim_path}"
-    )
     scene.contact_sensor.debug_vis = False
 
 
@@ -154,9 +163,12 @@ class RobotEnv(_PlatformRobotEnv):
             step_dt=self.step_dt,
             device=self.device,
             contact_sensor=self.contact_sensor,
+            contact_sensor_rows_by_env=self._contact_sensor_rows_by_env,
             frame_transformer=self.transformer,
             env_origin=self.scene.env_origins,
             debug=self.debug,
+            platform_drop_height=self.cfg.platform_drop_height,
+            target_drop_failure_distance=self.cfg.target_drop_failure_distance,
         )
 
     def _setup_scene(self):
