@@ -23,6 +23,8 @@ HEADLESS = True
 DEBUG_DRAW_PREGRASP = not HEADLESS
 pre_grasp_start_index = 0
 HAND_CONTACT_MAX_DATA_COUNT_PER_PRIM = 32
+MINIMUM_GRASP_SUCCESSES = 5
+MAX_ADDITIONAL_COLLECTION_ATTEMPTS = 3
 
 if str(CODEX_DIR) not in sys.path:
     sys.path.insert(0, str(CODEX_DIR))
@@ -429,14 +431,18 @@ def main(root_path, scene_num):
             debug=debug_draw_pregrasp,
         )
 
-        count = 0
+        collection_attempt = 1
         output_list_tmp = []
         obs, _ = env.reset()
         print("Grasp > START")
         print(f"Grasp > SCENE:{scene_num}")
         sys.stdout.flush()
         old_time = time.time()
-        minimum_successes = min(5, len(pre_grasp_group["data"][pre_grasp_start_index:]))
+        minimum_successes = min(
+            MINIMUM_GRASP_SUCCESSES,
+            len(pre_grasp_group["data"][pre_grasp_start_index:]),
+        )
+        max_collection_attempts = 1 + MAX_ADDITIONAL_COLLECTION_ATTEMPTS
 
         while simulation_app.is_running():
             with torch.inference_mode():
@@ -448,11 +454,21 @@ def main(root_path, scene_num):
                 output_list_tmp += env.act_pol.output_list
                 print("output_list_tmp : ", len(output_list_tmp))
                 if len(output_list_tmp) < minimum_successes:
-                    env.factory_reset()
-                    print("Grasp > factory_reset")
-                    count += 1
-                    if count < 4:
+                    if collection_attempt < max_collection_attempts:
+                        print(
+                            "Grasp > insufficient successes "
+                            f"({len(output_list_tmp)}/{minimum_successes}); "
+                            f"retry {collection_attempt}/"
+                            f"{MAX_ADDITIONAL_COLLECTION_ATTEMPTS}"
+                        )
+                        env.factory_reset()
+                        print("Grasp > factory_reset")
+                        collection_attempt += 1
                         continue
+                    print(
+                        "Grasp > retry limit reached; pass scene with "
+                        f"{len(output_list_tmp)}/{minimum_successes} successes"
+                    )
 
                 output_list += output_list_tmp
                 sorted_output_list = sorted(

@@ -115,7 +115,7 @@ def Set_RobotEnvCFG(envcfg, gripper_info):
 
 @configclass
 class RobotEnvCfg(_PlatformRobotEnvCfg):
-    envs = 150
+    envs = 400
     dt = SIM_DT
     robot_prim_path = "/World/envs/env_.*/Robot"
     filter_robot_platform_collision = True
