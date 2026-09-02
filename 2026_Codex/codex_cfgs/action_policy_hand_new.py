@@ -42,44 +42,17 @@ def _quaternion_slerp(
 
 def _interpolate_base_path(
     start_pos: torch.Tensor,
-    via_pos: torch.Tensor,
     end_pos: torch.Tensor,
     start_quat: torch.Tensor,
-    via_quat: torch.Tensor,
     end_quat: torch.Tensor,
     progress: torch.Tensor,
     use_smoothstep: torch.Tensor,
-    use_via: torch.Tensor,
-    via_ratio: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Interpolate a batched base path, preserving straight-path compatibility."""
+    """Interpolate the direct START-to-END base path."""
     smooth_progress = progress * progress * (3.0 - 2.0 * progress)
-    direct_amount = torch.where(use_smoothstep, smooth_progress, progress)
-    direct_position = torch.lerp(start_pos, end_pos, direct_amount[:, None])
-    direct_orientation = _quaternion_slerp(
-        start_quat, end_quat, direct_amount[:, None]
-    )
-    first_leg = progress <= via_ratio
-    leg_progress = torch.where(
-        first_leg,
-        progress / via_ratio,
-        (progress - via_ratio) / (1.0 - via_ratio),
-    ).clamp(0.0, 1.0)
-    smooth_leg = leg_progress * leg_progress * (3.0 - 2.0 * leg_progress)
-    leg_amount = torch.where(use_smoothstep, smooth_leg, leg_progress)
-    via_position = torch.where(
-        first_leg[:, None],
-        torch.lerp(start_pos, via_pos, leg_amount[:, None]),
-        torch.lerp(via_pos, end_pos, leg_amount[:, None]),
-    )
-    via_orientation = torch.where(
-        first_leg[:, None],
-        _quaternion_slerp(start_quat, via_quat, leg_amount[:, None]),
-        _quaternion_slerp(via_quat, end_quat, leg_amount[:, None]),
-    )
-    return (
-        torch.where(use_via[:, None], via_position, direct_position),
-        torch.where(use_via[:, None], via_orientation, direct_orientation),
+    amount = torch.where(use_smoothstep, smooth_progress, progress)
+    return torch.lerp(start_pos, end_pos, amount[:, None]), _quaternion_slerp(
+        start_quat, end_quat, amount[:, None]
     )
 
 
@@ -88,27 +61,10 @@ def _interpolate_joint_path(
     end_joint: torch.Tensor,
     progress: torch.Tensor,
     use_smoothstep: torch.Tensor,
-    use_via: torch.Tensor,
-    via_ratio: torch.Tensor,
 ) -> torch.Tensor:
-    """Interpolate joint targets with the same START-VIA-END timing as the base."""
+    """Interpolate joint targets directly from START to END."""
     smooth_progress = progress * progress * (3.0 - 2.0 * progress)
-    direct_amount = torch.where(use_smoothstep, smooth_progress, progress)
-
-    first_leg = progress <= via_ratio
-    leg_progress = torch.where(
-        first_leg,
-        progress / via_ratio,
-        (progress - via_ratio) / (1.0 - via_ratio),
-    ).clamp(0.0, 1.0)
-    smooth_leg = leg_progress * leg_progress * (3.0 - 2.0 * leg_progress)
-    leg_amount = torch.where(use_smoothstep, smooth_leg, leg_progress)
-    via_amount = torch.where(
-        first_leg,
-        via_ratio * leg_amount,
-        via_ratio + (1.0 - via_ratio) * leg_amount,
-    )
-    amount = torch.where(use_via, via_amount, direct_amount)
+    amount = torch.where(use_smoothstep, smooth_progress, progress)
     return torch.lerp(start_joint, end_joint, amount[:, None])
 
 
@@ -199,7 +155,7 @@ class HandActionPolicy:
 
         self._prepare_pre_grasps()
 
-        # 0: approach START from above, 1: base START->VIA->END while joints
+        # 0: approach START from above, 1: base and joints START->END,
         # command END directly, 2: lift,
         # 3: evaluate/done, 4: disabled.
         self.stage_num = torch.zeros(self.env_num, dtype=torch.long, device=self.device)
@@ -220,19 +176,13 @@ class HandActionPolicy:
         self.target_points = torch.zeros((self.env_num, 3), dtype=torch.float, device=self.device)
 
         self.start_pos = torch.zeros((self.env_num, 3), dtype=torch.float, device=self.device)
-        self.via_pos = torch.zeros_like(self.start_pos)
         self.end_pos = torch.zeros_like(self.start_pos)
         self.start_quat = torch.zeros((self.env_num, 4), dtype=torch.float, device=self.device)
-        self.via_quat = torch.zeros_like(self.start_quat)
         self.end_quat = torch.zeros_like(self.start_quat)
         self.start_joint = torch.zeros_like(self.target_joint)
         self.end_joint = torch.zeros_like(self.target_joint)
         self.transition_steps = torch.ones(self.env_num, dtype=torch.long, device=self.device)
         self.use_smoothstep = torch.ones(self.env_num, dtype=torch.bool, device=self.device)
-        self.use_via = torch.zeros(self.env_num, dtype=torch.bool, device=self.device)
-        self.via_ratio = torch.full(
-            (self.env_num,), 0.5, dtype=torch.float, device=self.device
-        )
         self.platform_drop_offset = torch.zeros(self.env_num, dtype=torch.float, device=self.device)
 
         self.object_pos_org = torch.tensor(
@@ -453,17 +403,13 @@ class HandActionPolicy:
             for index, name in enumerate(self.frame_transformer.data.target_frame_names)
         }
         start_pos = []
-        via_pos = []
         end_pos = []
         start_quat = []
-        via_quat = []
         end_quat = []
         start_joint = []
         end_joint = []
         transition_steps = []
         smoothstep = []
-        use_via = []
-        via_ratio = []
         target_class = []
         target_points = []
         grasp_bbox = []
@@ -476,42 +422,37 @@ class HandActionPolicy:
                 )
             start_position, start_orientation = self._require_pose(record, "start")
             end_position, end_orientation = self._require_pose(record, "end")
-            has_via = isinstance(record.get("target_base_tf", {}).get("via"), dict)
-            if has_via:
-                via_position, via_orientation = self._require_pose(record, "via")
-            else:
-                # Compatibility for pre-grasp JSON generated before VIA support.
-                via_position, via_orientation = start_position, start_orientation
+            target_base_tf = record.get("target_base_tf")
+            if isinstance(target_base_tf, dict):
+                target_base_tf.pop("via", None)
             target_object = record["target_object"]
             if target_object not in class_name_idx:
                 raise KeyError(f"Target object {target_object!r} is not present in the scene")
 
-            duration = float(record.get("transition", {}).get("duration_sec", 2.0))
+            transition = record.setdefault("transition", {})
+            duration = float(transition.get("duration_sec", 2.0))
+            if duration <= 0.0:
+                raise ValueError(
+                    f"Hand transition duration_sec must be positive: {duration}"
+                )
             interpolation = str(
-                record.get("transition", {}).get("interpolation", "smoothstep")
+                transition.get("interpolation", "smoothstep")
             ).lower()
             if interpolation not in {"linear", "smoothstep"}:
                 raise ValueError(
                     f"Unsupported hand transition interpolation: {interpolation!r}"
                 )
-            ratio = float(record.get("transition", {}).get("via_time_ratio", 0.5))
-            if not 0.0 < ratio < 1.0:
-                raise ValueError(
-                    f"Hand transition via_time_ratio must be between 0 and 1: {ratio}"
-                )
+            transition.pop("via_time_sec", None)
+            transition.pop("via_time_ratio", None)
 
             start_pos.append(start_position)
-            via_pos.append(via_position)
             end_pos.append(end_position)
             start_quat.append(start_orientation)
-            via_quat.append(via_orientation)
             end_quat.append(end_orientation)
             start_joint.append(self._joint_vector(record, "start"))
             end_joint.append(self._joint_vector(record, "end"))
-            transition_steps.append(max(1, int(round((duration * 0.5) / self.step_dt))))
+            transition_steps.append(max(1, int(round(duration / self.step_dt))))
             smoothstep.append(interpolation == "smoothstep")
-            use_via.append(has_via)
-            via_ratio.append(ratio)
             target_class.append(class_name_idx[target_object])
             target_points.append(record["target_points"])
             if "grasp_bbox" not in record:
@@ -531,17 +472,13 @@ class HandActionPolicy:
             return torch.tensor(values, dtype=dtype, device=self.device)
 
         self.total_start_pos = tensor(start_pos)
-        self.total_via_pos = tensor(via_pos)
         self.total_end_pos = tensor(end_pos)
         self.total_start_quat = _normalise_quaternion(tensor(start_quat))
-        self.total_via_quat = _normalise_quaternion(tensor(via_quat))
         self.total_end_quat = _normalise_quaternion(tensor(end_quat))
         self.total_start_joint = tensor(start_joint)
         self.total_end_joint = tensor(end_joint)
         self.total_transition_steps = tensor(transition_steps, dtype=torch.long)
         self.total_smoothstep = tensor(smoothstep, dtype=torch.bool)
-        self.total_use_via = tensor(use_via, dtype=torch.bool)
-        self.total_via_ratio = tensor(via_ratio)
         self.total_class = tensor(target_class, dtype=torch.long)
         self.total_target_points = tensor(target_points)
         self.total_grasp_bboxes = grasp_bbox
@@ -584,17 +521,13 @@ class HandActionPolicy:
         self.platform_drop_offset[active_envs] = 0.0
 
         self.start_pos[active_envs] = self.total_start_pos[source_ids]
-        self.via_pos[active_envs] = self.total_via_pos[source_ids]
         self.end_pos[active_envs] = self.total_end_pos[source_ids]
         self.start_quat[active_envs] = self.total_start_quat[source_ids]
-        self.via_quat[active_envs] = self.total_via_quat[source_ids]
         self.end_quat[active_envs] = self.total_end_quat[source_ids]
         self.start_joint[active_envs] = self.total_start_joint[source_ids]
         self.end_joint[active_envs] = self.total_end_joint[source_ids]
         self.transition_steps[active_envs] = self.total_transition_steps[source_ids]
         self.use_smoothstep[active_envs] = self.total_smoothstep[source_ids]
-        self.use_via[active_envs] = self.total_use_via[source_ids]
-        self.via_ratio[active_envs] = self.total_via_ratio[source_ids]
         self.target_class[active_envs] = self.total_class[source_ids]
         self.target_points[active_envs] = self.total_target_points[source_ids]
 
@@ -632,15 +565,11 @@ class HandActionPolicy:
             ).clamp(0.0, 1.0)
             base_position, base_orientation = _interpolate_base_path(
                 self.start_pos[stage1],
-                self.via_pos[stage1],
                 self.end_pos[stage1],
                 self.start_quat[stage1],
-                self.via_quat[stage1],
                 self.end_quat[stage1],
                 progress,
                 self.use_smoothstep[stage1],
-                self.use_via[stage1],
-                self.via_ratio[stage1],
             )
             self.root_pose[stage1, :3] = base_position
             self.root_pose[stage1, 3:7] = base_orientation
@@ -649,11 +578,9 @@ class HandActionPolicy:
                 self.end_joint[stage1],
                 progress,
                 self.use_smoothstep[stage1],
-                self.use_via[stage1],
-                self.via_ratio[stage1],
             )
             # Update the controller target every simulation step so the joint
-            # motion stays synchronized with the START-VIA-END base path.
+            # motion stays synchronized with the direct START-to-END base path.
             self.joint_command_dirty[stage1] = True
             self.stage_step[stage1] += 1
             joint_error = torch.linalg.vector_norm(

@@ -242,11 +242,8 @@ def _load_gripper_info(pre_grasp_group: dict, gripper_type: str) -> dict:
 def _inject_missing_hand_preset_metadata(
     pre_grasp_group: dict, gripper_info: dict
 ) -> int:
-    """Add current VIA and contact-set metadata to legacy records in memory."""
-    from pregrasp.hand_pregrasp_heightmap import (
-        preset_contact_sensor_sets,
-        target_pose_from_start_correspondence,
-    )
+    """Refresh transition/contact metadata and strip obsolete VIA fields."""
+    from pregrasp.hand_pregrasp_heightmap import preset_contact_sensor_sets
 
     presets = {
         str(preset.get("name")): preset
@@ -260,39 +257,30 @@ def _inject_missing_hand_preset_metadata(
             continue
         record_updated = False
         target_base_tf = record.get("target_base_tf")
-        if (
-            isinstance(target_base_tf, dict)
-            and isinstance(preset.get("via_base_tf"), dict)
-            and not isinstance(target_base_tf.get("via"), dict)
-        ):
-            target_start = target_base_tf.get("start")
-            template_start = preset.get("start_base_tf")
-            if isinstance(target_start, dict) and isinstance(template_start, dict):
-                target_base_tf["via"] = target_pose_from_start_correspondence(
-                    template_start, preset["via_base_tf"], target_start
-                )
-                record_updated = True
+        if isinstance(target_base_tf, dict) and "via" in target_base_tf:
+            target_base_tf.pop("via", None)
+            record_updated = True
         preset_transition = preset.get("transition")
-        if isinstance(preset_transition, dict) and isinstance(
-            preset_transition.get("via_time_ratio"), (int, float)
-        ):
+        if isinstance(preset_transition, dict):
             record_transition = record.setdefault("transition", {})
-            if isinstance(record_transition, dict) and "via_time_ratio" not in record_transition:
-                record_transition["via_time_ratio"] = float(
-                    preset_transition["via_time_ratio"]
-                )
-                record_updated = True
+            if isinstance(record_transition, dict):
+                for key in (
+                    "duration_sec",
+                    "interpolation",
+                ):
+                    if key in preset_transition and key not in record_transition:
+                        record_transition[key] = copy.deepcopy(preset_transition[key])
+                        record_updated = True
+                for obsolete_key in ("via_time_sec", "via_time_ratio"):
+                    if obsolete_key in record_transition:
+                        record_transition.pop(obsolete_key, None)
+                        record_updated = True
         current_contact_sets = preset_contact_sensor_sets(preset)
         if record.get("contact_sensor_sets") != current_contact_sets:
             record["contact_sensor_sets"] = current_contact_sets
             record_updated = True
         updated += int(record_updated)
     return updated
-
-
-def _inject_missing_hand_via_metadata(pre_grasp_group: dict, gripper_info: dict) -> int:
-    """Backward-compatible alias for callers using the former helper name."""
-    return _inject_missing_hand_preset_metadata(pre_grasp_group, gripper_info)
 
 
 def _save_output(path: Path, records: list[dict]) -> None:

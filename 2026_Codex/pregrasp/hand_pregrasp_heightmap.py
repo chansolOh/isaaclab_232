@@ -802,33 +802,14 @@ def target_pose_from_tcp(
     }
 
 
-def target_pose_from_start_correspondence(
-    template_start_pose: dict,
-    template_pose: dict,
-    target_start_pose: dict,
-) -> dict:
-    """Map a template waypoint using the rigid transform START acquired."""
-    template_start = pose_matrix(template_start_pose)
-    template_waypoint = pose_matrix(template_pose)
-    target_start = pose_matrix(target_start_pose)
-    target_waypoint = target_start @ np.linalg.inv(template_start) @ template_waypoint
-    rotation = target_waypoint[:3, :3]
-    return {
-        "frame": "world",
-        "position": target_waypoint[:3, 3].tolist(),
-        "orientation_wxyz": matrix_to_quaternion_wxyz(rotation).tolist(),
-        "rpy_deg": _matrix_to_rpy_degrees(rotation),
-    }
-
-
 def target_base_tf_from_tcp(
     preset: dict,
     target_tcp_world: Sequence[float],
     yaw_deg: float,
 ) -> dict:
-    """Return START/VIA/END base transforms about the same target TCP."""
+    """Return direct START/END base transforms about the same target TCP."""
     template_tcp = preset_tcp_world_point(preset)
-    result = {
+    return {
         "start": target_pose_from_tcp(
             preset["start_base_tf"], template_tcp, target_tcp_world, yaw_deg
         ),
@@ -836,12 +817,6 @@ def target_base_tf_from_tcp(
             preset["end_base_tf"], template_tcp, target_tcp_world, yaw_deg
         ),
     }
-    via_base_tf = preset.get("via_base_tf")
-    if isinstance(via_base_tf, dict):
-        result["via"] = target_pose_from_tcp(
-            via_base_tf, template_tcp, target_tcp_world, yaw_deg
-        )
-    return result
 
 
 def preset_contact_sensor_sets(preset: dict) -> dict[str, list[str]]:

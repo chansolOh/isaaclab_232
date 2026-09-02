@@ -154,6 +154,16 @@ class FingerActionPolicy:
         self.open_joint = torch.zeros_like(self.target_joint)
         self.close_joint = torch.zeros_like(self.target_joint)
         self.approach_start_joint = torch.zeros_like(self.target_joint)
+        # Actual execution endpoints saved with the same start/end schema used
+        # by hand grasp records. Finger END is the blocked grasp pose, not the
+        # fully-closed drive target.
+        self.executed_start_base_pose = torch.zeros(
+            (self.env_num, 7), dtype=torch.float, device=device
+        )
+        self.executed_start_base_pose[:, 3] = 1.0
+        self.executed_end_base_pose = self.executed_start_base_pose.clone()
+        self.executed_start_joint = torch.zeros_like(self.target_joint)
+        self.executed_end_joint = torch.zeros_like(self.target_joint)
         self.width_ready = torch.zeros(
             self.env_num, dtype=torch.bool, device=device
         )
@@ -318,6 +328,12 @@ class FingerActionPolicy:
         self.close_error_valid[active_envs] = False
         self.close_stall_count[active_envs] = 0
         self.width_ready[active_envs] = False
+        self.executed_start_base_pose[active_envs] = 0.0
+        self.executed_start_base_pose[active_envs, 3] = 1.0
+        self.executed_end_base_pose[active_envs] = 0.0
+        self.executed_end_base_pose[active_envs, 3] = 1.0
+        self.executed_start_joint[active_envs] = 0.0
+        self.executed_end_joint[active_envs] = 0.0
 
         self.base_position[active_envs] = self.total_base_position[source_ids]
         self.base_quaternion[active_envs] = self.total_base_quaternion[source_ids]
@@ -459,6 +475,10 @@ class FingerActionPolicy:
             self.stage_step[stage0] += 1
             done = stage0[self.stage_step[stage0] >= self.approach_steps]
             if len(done):
+                self.executed_start_base_pose[done] = self.root_pose[done]
+                self.executed_start_joint[done] = self.joint_pos[done][
+                    :, self.joint_index
+                ]
                 self.stage_num[done] = 1
                 self.stage_step[done] = 0
                 self.target_joint[done] = self.close_joint[done]
@@ -534,6 +554,10 @@ class FingerActionPolicy:
 
         grasped_envs = idx[grasped]
         if len(grasped_envs):
+            self.executed_end_base_pose[grasped_envs] = self.root_pose[grasped_envs]
+            self.executed_end_joint[grasped_envs] = self.joint_pos[grasped_envs][
+                :, self.joint_index
+            ]
             self.stage_num[grasped_envs] = 2
             self.stage_step[grasped_envs] = 0
         failed_envs = idx[empty]
@@ -786,6 +810,12 @@ class FingerActionPolicy:
                 source_id = int(self.assigned_pregrasp[env_id])
                 source = self.pre_grasp_data[source_id]
                 bbox_2d = self._bbox_3d_to_2d(bboxes[output_index].detach().cpu().numpy())
+                start_pose = self.executed_start_base_pose[env_id].detach().cpu().tolist()
+                end_pose = self.executed_end_base_pose[env_id].detach().cpu().tolist()
+                base_rpy_deg = [float(value) for value in source["target_orientation"]]
+                base_rpy_deg[0] += 180.0
+                start_joint = self.executed_start_joint[env_id].detach().cpu().tolist()
+                end_joint = self.executed_end_joint[env_id].detach().cpu().tolist()
                 self.output_list.append(
                     {
                         "bbox_2d": self._bbox_summary(
@@ -797,6 +827,35 @@ class FingerActionPolicy:
                         "target_object": source["target_object"],
                         "gripper_model": self.gripper_info["gripper_name"],
                         "gripper_type": self.gripper_info["type"],
+                        "target_base_tf": {
+                            "start": {
+                                "frame": "world",
+                                "position": [float(value) for value in start_pose[:3]],
+                                "orientation_wxyz": [
+                                    float(value) for value in start_pose[3:7]
+                                ],
+                                "rpy_deg": copy.deepcopy(base_rpy_deg),
+                            },
+                            "end": {
+                                "frame": "world",
+                                "position": [float(value) for value in end_pose[:3]],
+                                "orientation_wxyz": [
+                                    float(value) for value in end_pose[3:7]
+                                ],
+                                "rpy_deg": copy.deepcopy(base_rpy_deg),
+                            },
+                        },
+                        "target_joint_pos": {
+                            "start": {
+                                name: float(value)
+                                for name, value in zip(self.joint_names, start_joint)
+                            },
+                            "end": {
+                                name: float(value)
+                                for name, value in zip(self.joint_names, end_joint)
+                            },
+                        },
+                        "joint_unit": "rad",
                         "disturbed_object_count": int(disturbed[success_rows[output_index]]),
                     }
                 )
