@@ -8,10 +8,6 @@ from isaacsim.core.utils.rotations import quat_to_euler_angles
 @configclass
 class SceneCfg(InteractiveSceneCfg):
 
-    ground = AssetBaseCfg(
-        prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg()
-    )
-
     light = AssetBaseCfg(
         prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )

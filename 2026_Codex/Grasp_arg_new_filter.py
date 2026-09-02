@@ -13,7 +13,7 @@ parser.add_argument(
 )
 parser.add_argument("--env_name", default="Home", type=str)
 parser.add_argument("--section_name", default="MasterBedroom", type=str)
-parser.add_argument("--platform_name", default="sideboard_01", type=str)
+parser.add_argument("--platform_name", default="floor_01", type=str)
 parser.add_argument("--scene_start", default=62, type=int)
 parser.add_argument("--pre_grasp_index", default=0, type=int, help=argparse.SUPPRESS)
 args = parser.parse_args()
