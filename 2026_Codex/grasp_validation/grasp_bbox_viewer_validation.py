@@ -1412,7 +1412,7 @@ class ImageGraspViewer:
         return processed_bboxes
     
     def draw_bbox_on_image(self, image, bbox, gripper_type="finger2", color=True, line_width=3):
-        """이미지에 bbox 그리기 (finger3는 2,3 꼭지점 제외)"""
+        """이미지에 bbox 그리기 (finger3만 2,3 꼭지점 제외)"""
         draw = ImageDraw.Draw(image)
         
         # 색상 설정
@@ -1434,7 +1434,7 @@ class ImageGraspViewer:
             draw.line([tuple(bbox_array[0]), tuple(bbox_array[1])], fill=line2_color, width=line_width)
             draw.line([tuple(bbox_array[2]), tuple(bbox_array[3])], fill=line2_color, width=line_width)
         
-        elif gripper_type in ["finger3", "finger3_parallel", "Hand", "hand"]:
+        elif gripper_type in ["finger3", "finger3_parallel"]:
             if len(bbox.shape) == 3:  # (N, 4, 2)
                 for i in range(len(bbox)):
                     bbox_single = bbox[i]
@@ -1454,6 +1454,17 @@ class ImageGraspViewer:
                 
                 # [0,1] 연결만 그리기 (2,3 연결 제외)
                 draw.line([tuple(bbox_array[0]), tuple(bbox_array[1])], fill=line2_color, width=line_width)
+
+        elif gripper_type in ["Hand", "hand"]:
+            bbox_array = np.asarray(bbox)
+            if bbox_array.ndim == 2:
+                bbox_array = bbox_array[None, ...]
+
+            for bbox_single in bbox_array:
+                draw.line([tuple(bbox_single[1]), tuple(bbox_single[2])], fill=line1_color, width=line_width)
+                draw.line([tuple(bbox_single[3]), tuple(bbox_single[0])], fill=line1_color, width=line_width)
+                draw.line([tuple(bbox_single[0]), tuple(bbox_single[1])], fill=line2_color, width=line_width)
+                draw.line([tuple(bbox_single[2]), tuple(bbox_single[3])], fill=line2_color, width=line_width)
     
     def create_segmentation_mask(self, inst_seg_data, target_object, opacity=0.3):
         """특정 target_object에 해당하는 segmentation 마스크 생성"""

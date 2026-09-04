@@ -282,6 +282,27 @@ def main() -> None:
     parser.add_argument("--root_path", required=True)
     parser.add_argument("--scene_num", required=True, type=int)
     parser.add_argument("--grasp_index", required=True, type=int)
+    parser.add_argument(
+        "--extra_grasp_indices",
+        default="",
+        help="Comma-separated output indices to run alongside grasp_index.",
+    )
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=1,
+        help="Physical Isaac Lab environment count (default: 1).",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Disable the viewer for collection-scale replay diagnostics.",
+    )
+    parser.add_argument(
+        "--one_shot",
+        action="store_true",
+        help="Exit after all supplied records have completed once.",
+    )
     parser.add_argument("--control_file", type=Path)
     parser.add_argument("--status_file", type=Path)
     args = parser.parse_args()
@@ -290,7 +311,32 @@ def main() -> None:
     status_file = args.status_file
     scene_num = int(args.scene_num)
     grasp_index = int(args.grasp_index)
-    replay_record, metadata = resolve_replay_record(root_path, scene_num, grasp_index)
+    num_envs = int(args.num_envs)
+    if num_envs < 1:
+        raise ValueError(f"num_envs must be at least 1, got {num_envs}")
+    extra_indices = [
+        int(value.strip())
+        for value in args.extra_grasp_indices.split(",")
+        if value.strip()
+    ]
+    replay_indices = [grasp_index, *extra_indices]
+    replay_records_and_metadata = [
+        resolve_replay_record(root_path, scene_num, index)
+        for index in replay_indices
+    ]
+    replay_records = [item[0] for item in replay_records_and_metadata]
+    replay_record, metadata = replay_records_and_metadata[0]
+    if len(replay_records) > num_envs:
+        raise ValueError(
+            f"{len(replay_records)} replay records require at least that many envs, "
+            f"got {num_envs}"
+        )
+    replay_models = {record.get("gripper_model") for record in replay_records}
+    if len(replay_models) != 1:
+        raise ValueError(
+            "All simultaneous replay records must use the same gripper model: "
+            f"{sorted(replay_models)}"
+        )
 
     # AppLauncher owns Kit arguments; the verifier deliberately remains visible.
     sys.argv = [sys.argv[0]]
@@ -299,7 +345,7 @@ def main() -> None:
     launcher_parser = argparse.ArgumentParser(add_help=False)
     AppLauncher.add_app_launcher_args(launcher_parser)
     launcher_args = launcher_parser.parse_args([])
-    launcher_args.headless = HEADLESS
+    launcher_args.headless = bool(args.headless or HEADLESS)
     app_launcher = AppLauncher(launcher_args)
     simulation_app = app_launcher.app
     env = None
@@ -320,7 +366,7 @@ def main() -> None:
         )
         group = {
             "gripper_model": replay_record["gripper_model"],
-            "data": [replay_record],
+            "data": replay_records,
         }
         gripper_type = grasp_main._detect_gripper_type(group)
         gripper_info = grasp_main._load_gripper_info(group, gripper_type)
@@ -335,10 +381,10 @@ def main() -> None:
         # Load to Sim must use the exact same shared PhysicsScene settings as
         # output-grasp collection instead of maintaining replay-only values.
         env_cfg.sim = make_grasp_simulation_cfg()
-        env_cfg.envs = 1
-        env_cfg.scene.num_envs = 1
+        env_cfg.envs = num_envs
+        env_cfg.scene.num_envs = num_envs
         if is_hand:
-            robot_module.Set_RobotEnvCFG(env_cfg, gripper_info, [replay_record])
+            robot_module.Set_RobotEnvCFG(env_cfg, gripper_info, replay_records)
         else:
             robot_module.Set_RobotEnvCFG(env_cfg, gripper_info)
 
@@ -358,7 +404,7 @@ def main() -> None:
 
         env = robot_module.RobotEnv(
             cfg=env_cfg,
-            pre_grasp_data=[replay_record],
+            pre_grasp_data=replay_records,
             conf_data=conf_data,
             # Legacy finger policies generate their 3D approach bbox here.
             # Hand debug drawing is enabled only when the true pre_grasp bbox
@@ -367,8 +413,9 @@ def main() -> None:
             debug=(not is_hand or bool(metadata["matched_grasp_bbox"])),
         )
         env.reset()
-        debug_draw = OutputGraspDebugDraw()
-        debug_draw.draw_record(replay_record, metadata)
+        debug_draw = None if launcher_args.headless else OutputGraspDebugDraw()
+        if debug_draw is not None:
+            debug_draw.draw_record(replay_record, metadata)
 
         request_id = -1
         cycle_count = 0
@@ -422,7 +469,8 @@ def main() -> None:
                         # in-place update error when switching a grasp.
                         with torch.inference_mode():
                             env.factory_reset()
-                        debug_draw.draw_record(replay_record, metadata)
+                        if debug_draw is not None:
+                            debug_draw.draw_record(replay_record, metadata)
                         grasp_index = requested_index
                         cycle_count = 0
                         last_reset_time = now
@@ -440,12 +488,23 @@ def main() -> None:
                         sys.stdout.flush()
 
             with torch.inference_mode():
-                action = torch.ones((1,), device=env.device)
+                action = torch.ones((num_envs,), device=env.device)
                 obs, _rew, _term, _trunc, _info = env.step(action)
                 if obs["policy"].sum() == 0 and now - last_reset_time >= REPLAY_RESET_DELAY_SEC:
                     cycle_count += 1
+                    if args.one_shot:
+                        print(
+                            "Replay > one_shot_complete "
+                            f"indices={replay_indices} "
+                            "penetration_failed_sources="
+                            f"{sorted(env.act_pol.penetration_failed_source_ids)} "
+                            f"successes={len(env.act_pol.output_list)}",
+                            flush=True,
+                        )
+                        break
                     env.factory_reset()
-                    debug_draw.draw_record(replay_record, metadata)
+                    if debug_draw is not None:
+                        debug_draw.draw_record(replay_record, metadata)
                     last_reset_time = now
                     save_status(
                         status_file,

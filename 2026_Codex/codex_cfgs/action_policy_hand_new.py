@@ -83,6 +83,9 @@ class HandActionPolicy:
         step_dt,
         device,
         contact_sensor,
+        contact_sensor_rows_by_env,
+        penetration_contact_sensors,
+        penetration_contact_sensor_rows_by_env,
         frame_transformer,
         env_origin,
         contact_penetration_threshold,
@@ -109,6 +112,38 @@ class HandActionPolicy:
         self.step_dt = float(step_dt)
         self.device = device
         self.contact_sensor = contact_sensor
+        self.contact_sensor_rows_by_env = torch.as_tensor(
+            contact_sensor_rows_by_env, dtype=torch.long, device=self.device
+        )
+        self._validate_contact_sensor_rows(
+            self.contact_sensor, self.contact_sensor_rows_by_env, "aggregate"
+        )
+        self.penetration_contact_sensors = list(penetration_contact_sensors)
+        self.penetration_contact_sensor_rows_by_env = [
+            torch.as_tensor(rows, dtype=torch.long, device=self.device)
+            for rows in penetration_contact_sensor_rows_by_env
+        ]
+        if (
+            not self.penetration_contact_sensors
+            or len(self.penetration_contact_sensors)
+            != len(self.penetration_contact_sensor_rows_by_env)
+        ):
+            raise ValueError(
+                "Per-fingertip penetration sensors and row mappings must be "
+                "non-empty and have equal length"
+            )
+        self.penetration_contact_sensor_physical_row_to_env = []
+        for index, (sensor, rows) in enumerate(
+            zip(
+                self.penetration_contact_sensors,
+                self.penetration_contact_sensor_rows_by_env,
+            )
+        ):
+            self.penetration_contact_sensor_physical_row_to_env.append(
+                self._validate_contact_sensor_rows(
+                    sensor, rows, f"penetration[{index}]", require_filters=True
+                )
+            )
         self.contact_penetration_threshold = float(contact_penetration_threshold)
         if self.contact_penetration_threshold < 0.0:
             raise ValueError("contact_penetration_threshold must be non-negative")
@@ -152,6 +187,9 @@ class HandActionPolicy:
         self.total_grasp_num = len(pre_grasp_data)
         self.current_grasp_num = 0
         self.output_list = []
+        self.penetration_failure_count = 0
+        self.penetration_failed_source_ids: set[int] = set()
+        self.deepest_contact_separation = math.inf
 
         self._prepare_pre_grasps()
 
@@ -198,6 +236,46 @@ class HandActionPolicy:
             ),
             None,
         )
+
+    def _validate_contact_sensor_rows(
+        self, sensor, rows: torch.Tensor, label: str, require_filters: bool = False
+    ) -> torch.Tensor:
+        if rows.ndim != 2 or rows.shape[0] != self.env_num:
+            raise ValueError(
+                f"{label} contact sensor rows must have shape "
+                f"({self.env_num}, physical_rows_per_env), got {tuple(rows.shape)}"
+            )
+        physical_row_count = int(sensor._num_envs)
+        flat_rows = rows.reshape(-1)
+        if (
+            flat_rows.numel() != physical_row_count
+            or torch.unique(flat_rows).numel() != physical_row_count
+            or int(flat_rows.min()) != 0
+            or int(flat_rows.max()) != physical_row_count - 1
+        ):
+            raise ValueError(
+                f"{label} contact sensor mapping must contain every physical "
+                f"row exactly once; physical_rows={physical_row_count}, "
+                f"mapping_shape={tuple(rows.shape)}"
+            )
+        physical_to_logical = torch.empty(
+            physical_row_count, dtype=torch.long, device=self.device
+        )
+        logical_ids = torch.arange(
+            self.env_num, dtype=torch.long, device=self.device
+        )[:, None].expand_as(rows)
+        physical_to_logical[flat_rows] = logical_ids.reshape(-1)
+        expected_sensor_count = physical_row_count * int(sensor.num_bodies)
+        contact_view = sensor.contact_physx_view
+        if int(contact_view.sensor_count) != expected_sensor_count:
+            raise RuntimeError(
+                f"{label} detailed-view size mismatch: "
+                f"sensor_count={int(contact_view.sensor_count)}, "
+                f"expected={expected_sensor_count}"
+            )
+        if require_filters and int(contact_view.filter_count) < 1:
+            raise RuntimeError(f"{label} penetration sensor has no object filters")
+        return physical_to_logical
 
     def _clear_debug_draw(self) -> None:
         if not self.debug or self._debug_draw is None:
@@ -669,49 +747,55 @@ class HandActionPolicy:
 
     def _minimum_contact_separation_by_env(self) -> torch.Tensor:
         """Return the deepest hand-object contact separation in every env."""
-        contact_view = self.contact_sensor.contact_physx_view
-        if int(contact_view.filter_count) < 1:
-            raise RuntimeError(
-                "Hand penetration checking requires contact sensor object filters"
-            )
-
-        _, _, _, separations, counts, starts = contact_view.get_contact_data(
-            dt=self.step_dt
-        )
-        counts = counts.reshape(-1).to(device=self.device, dtype=torch.long)
-        starts = starts.reshape(-1).to(device=self.device, dtype=torch.long)
         minimum = torch.full(
             (self.env_num,),
             torch.inf,
-            dtype=separations.dtype,
+            dtype=torch.float,
             device=self.device,
         )
-        total_contacts = int(counts.sum().item())
-        if total_contacts == 0:
-            return minimum
+        for sensor, physical_row_to_env in zip(
+            self.penetration_contact_sensors,
+            self.penetration_contact_sensor_physical_row_to_env,
+        ):
+            contact_view = sensor.contact_physx_view
+            _, _, _, separations, counts, starts = contact_view.get_contact_data(
+                dt=self.step_dt
+            )
+            counts = counts.reshape(-1).to(device=self.device, dtype=torch.long)
+            starts = starts.reshape(-1).to(device=self.device, dtype=torch.long)
+            total_contacts = int(counts.sum().item())
+            if total_contacts == 0:
+                continue
 
-        pair_ids = torch.repeat_interleave(
-            torch.arange(counts.numel(), device=self.device), counts
-        )
-        packed_starts = counts.cumsum(0) - counts
-        offsets = torch.arange(total_contacts, device=self.device) - (
-            packed_starts.repeat_interleave(counts)
-        )
-        contact_indices = starts[pair_ids] + offsets
-        valid_separations = separations.reshape(-1).index_select(
-            0, contact_indices
-        )
+            pair_ids = torch.repeat_interleave(
+                torch.arange(counts.numel(), device=self.device), counts
+            )
+            packed_starts = counts.cumsum(0) - counts
+            offsets = torch.arange(total_contacts, device=self.device) - (
+                packed_starts.repeat_interleave(counts)
+            )
+            contact_indices = starts[pair_ids] + offsets
+            valid_separations = separations.reshape(-1).index_select(
+                0, contact_indices
+            )
 
-        filter_count = int(contact_view.filter_count)
-        sensor_ids = pair_ids // filter_count
-        contact_env_ids = sensor_ids // int(self.contact_sensor.num_bodies)
-        minimum.scatter_reduce_(
-            0,
-            contact_env_ids,
-            valid_separations,
-            reduce="amin",
-            include_self=True,
-        )
+            filter_count = int(contact_view.filter_count)
+            sensor_ids = pair_ids // filter_count
+            physical_row_ids = sensor_ids // int(sensor.num_bodies)
+            contact_env_ids = physical_row_to_env[physical_row_ids]
+            minimum.scatter_reduce_(
+                0,
+                contact_env_ids,
+                valid_separations,
+                reduce="amin",
+                include_self=True,
+            )
+        finite = torch.isfinite(minimum)
+        if torch.any(finite):
+            self.deepest_contact_separation = min(
+                self.deepest_contact_separation,
+                float(minimum[finite].min()),
+            )
         return minimum
 
     def _mark_penetration_failures(self) -> torch.Tensor:
@@ -726,16 +810,13 @@ class HandActionPolicy:
         if not torch.any(eligible):
             return done
 
-        # Avoid requesting the much larger detailed contact buffer while no
-        # configured hand contact-sensor body is touching anything.
-        net_forces = self.contact_sensor.data.net_forces_w
-        touching = torch.linalg.vector_norm(net_forces, dim=-1).amax(dim=1) > 0.0
-        if not torch.any(eligible & touching):
-            return done
-
+        # Do not gate detailed separation on aggregate net force.  A directly
+        # posed hand can have a valid negative separation while its summed
+        # contact force is zero for that frame (or forces cancel across contact
+        # points).  That made multi-env runs silently skip penetration checks.
         minimum_separation = self._minimum_contact_separation_by_env()
         if self.print_contact_separation:
-            finite = eligible & touching & torch.isfinite(minimum_separation)
+            finite = eligible & torch.isfinite(minimum_separation)
             deeper = minimum_separation < (
                 self._printed_minimum_separation
                 - self.contact_separation_print_delta
@@ -763,6 +844,11 @@ class HandActionPolicy:
         if len(failed_env_ids) == 0:
             return done
 
+        self.penetration_failure_count += int(len(failed_env_ids))
+        failed_source_ids = self.assigned_pregrasp[failed_env_ids]
+        self.penetration_failed_source_ids.update(
+            int(source_id) for source_id in failed_source_ids.detach().cpu().tolist()
+        )
         self.grasp_fail_idx[failed_env_ids] = True
         self.stage_num[failed_env_ids] = 3
         self.stage_step[failed_env_ids] = 0

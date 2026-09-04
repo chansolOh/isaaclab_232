@@ -16,7 +16,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
@@ -204,6 +204,27 @@ def Set_RobotEnvCFG(envcfg, gripper_info, pre_grasp_data):
     envcfg.scene.contact_sensor.prim_path = (
         f"{envcfg.robot_prim_path}/{envcfg.contact_sensor_prim_path}"
     )
+    # A filtered PhysX contact view supports one sensor body against many
+    # filters, but not many fingertip bodies against many scene objects. Keep
+    # the combined sensor for aggregate forces/compliance and create one
+    # detailed separation sensor per configured fingertip.
+    envcfg.scene.contact_sensor.filter_prim_paths_expr = []
+    envcfg.penetration_contact_sensor_names = []
+    for index, configured_path in enumerate(gripper_info["contact_sensor_paths"]):
+        relative_path = configured_path.strip().strip("/")
+        sensor_name = f"penetration_contact_sensor_{index:02d}"
+        setattr(
+            envcfg.scene,
+            sensor_name,
+            ContactSensorCfg(
+                prim_path=f"{envcfg.robot_prim_path}/{relative_path}",
+                update_period=0.0,
+                history_length=0,
+                debug_vis=False,
+                class_type=EnvGroupedContactSensor,
+            ),
+        )
+        envcfg.penetration_contact_sensor_names.append(sensor_name)
     # Do not cap passive/mimic DOFs by default.  PhysX mimic constraints use
     # those DOFs internally, so forcing the same low gripper effort limit onto
     # them can make the hand feel weak when mimic damping is tuned in the USD.
@@ -316,7 +337,13 @@ class RobotEnv(DirectRLEnv):
         self.pre_grasp_data = [] if pre_grasp_data is None else pre_grasp_data
         self.conf_data = {} if conf_data is None else conf_data
         self.debug = debug
-        self._contact_sensor_rows_by_env = self._resolve_contact_sensor_rows_by_env()
+        self._contact_sensor_rows_by_env = self._resolve_contact_sensor_rows_by_env(
+            self.contact_sensor
+        )
+        self._penetration_contact_sensor_rows_by_env = [
+            self._resolve_contact_sensor_rows_by_env(sensor)
+            for sensor in self.penetration_contact_sensors
+        ]
         self.act_pol = self._make_action_policy()
         self._last_root_pose_command = self.robot.data.default_root_state[:, :7].clone()
         self._last_root_pose_command[:, :3] += self.scene.env_origins
@@ -378,13 +405,13 @@ class RobotEnv(DirectRLEnv):
                 f"damping={float(damping[joint_id]):.6g}"
             )
 
-    def _resolve_contact_sensor_rows_by_env(self) -> torch.Tensor:
-        rows = getattr(self.contact_sensor, "logical_env_rows", None)
+    def _resolve_contact_sensor_rows_by_env(self, sensor) -> torch.Tensor:
+        rows = getattr(sensor, "logical_env_rows", None)
         if rows is None:
-            if self.contact_sensor._num_envs != self.num_envs:
+            if sensor._num_envs != self.num_envs:
                 raise RuntimeError(
                     "Contact sensor physical rows do not match logical environments: "
-                    f"sensor={self.contact_sensor._num_envs}, env={self.num_envs}"
+                    f"sensor={sensor._num_envs}, env={self.num_envs}"
                 )
             rows = torch.arange(
                 self.num_envs, dtype=torch.long, device=self.device
@@ -408,6 +435,11 @@ class RobotEnv(DirectRLEnv):
             step_dt=self.step_dt,
             device=self.device,
             contact_sensor=self.contact_sensor,
+            contact_sensor_rows_by_env=self._contact_sensor_rows_by_env,
+            penetration_contact_sensors=self.penetration_contact_sensors,
+            penetration_contact_sensor_rows_by_env=(
+                self._penetration_contact_sensor_rows_by_env
+            ),
             frame_transformer=self.transformer,
             env_origin=self.scene.env_origins,
             debug=self.debug,
@@ -441,6 +473,10 @@ class RobotEnv(DirectRLEnv):
         self._define_platform_rigid_body_schema()
         self.transformer = self.scene["transformer"]
         self.contact_sensor = self.scene["contact_sensor"]
+        self.penetration_contact_sensors = [
+            self.scene[name]
+            for name in self.cfg.penetration_contact_sensor_names
+        ]
         self.scene.clone_environments(copy_from_source=False)
         self._filter_robot_platform_collision_pairs()
         self.scene.articulations["robot"] = self.robot

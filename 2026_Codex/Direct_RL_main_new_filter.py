@@ -168,10 +168,19 @@ def _configure_hand_contact_separation_filters(
         )
     if not filter_paths:
         raise ValueError("Hand contact-separation checking requires scene objects")
-    scene.contact_sensor.filter_prim_paths_expr = filter_paths
-    scene.contact_sensor.max_contact_data_count_per_prim = (
-        HAND_CONTACT_MAX_DATA_COUNT_PER_PRIM
-    )
+    scene.contact_sensor.filter_prim_paths_expr = []
+    configured_sensor_count = 0
+    for index in range(64):
+        sensor = getattr(scene, f"penetration_contact_sensor_{index:02d}", None)
+        if sensor is None:
+            break
+        sensor.filter_prim_paths_expr = list(filter_paths)
+        sensor.max_contact_data_count_per_prim = (
+            HAND_CONTACT_MAX_DATA_COUNT_PER_PRIM
+        )
+        configured_sensor_count += 1
+    if configured_sensor_count == 0:
+        raise RuntimeError("No per-fingertip penetration contact sensors were configured")
 
 
 def _select_pre_grasp_group(payload) -> dict:
@@ -441,6 +450,13 @@ def main(root_path, scene_num):
 
                 output_list_tmp += env.act_pol.output_list
                 print("output_list_tmp : ", len(output_list_tmp))
+                if is_hand:
+                    print(
+                        "Grasp > penetration_summary "
+                        f"failures={env.act_pol.penetration_failure_count} "
+                        "deepest_separation="
+                        f"{env.act_pol.deepest_contact_separation:.6f}"
+                    )
                 if len(output_list_tmp) < minimum_successes:
                     if collection_attempt < max_collection_attempts:
                         print(
