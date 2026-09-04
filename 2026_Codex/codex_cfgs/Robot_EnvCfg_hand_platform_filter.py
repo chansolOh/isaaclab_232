@@ -340,6 +340,12 @@ class RobotEnv(DirectRLEnv):
         self._contact_sensor_rows_by_env = self._resolve_contact_sensor_rows_by_env(
             self.contact_sensor
         )
+        # Finger environments inherit this class for the shared platform/root
+        # implementation but override _setup_scene() and do not create the
+        # hand-only per-fingertip penetration sensors.
+        self.penetration_contact_sensors = list(
+            getattr(self, "penetration_contact_sensors", [])
+        )
         self._penetration_contact_sensor_rows_by_env = [
             self._resolve_contact_sensor_rows_by_env(sensor)
             for sensor in self.penetration_contact_sensors
