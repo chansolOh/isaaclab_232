@@ -15,8 +15,9 @@ FINGER_GRIPPER_INFO_PATH = Path(
     "/nas/ochansol/gripper_info/gripper_info_new_2026.json"
 )
 HAND_GRIPPER_INFO_PATH = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
-# OBJECT_NAME_CSV_PATH = Path("/nas/ochansol/3d_model/2024_2025_objects_cat_attr.csv")
-OBJECT_NAME_CSV_PATH = Path("/nas/ochansol/3d_model/2026_objects_cat_attr.csv")
+OBJECT_NAME_CSV_PATH = Path(
+    "/nas/ochansol/3d_model/peel3_scan_data_2026/2026_objects_cat_attr.csv"
+)
 CODEX_DIR = Path(__file__).resolve().parent
 LEGACY_CHANSOL_DIR = CODEX_DIR.parent / "chansol"
 HEADLESS = True
