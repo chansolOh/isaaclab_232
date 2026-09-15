@@ -11,10 +11,10 @@ parser.add_argument(
     default="/nas/Dataset/Dataset_2026/dataset_v2",
     type=str,
 )
-parser.add_argument("--env_name", default="Home", type=str)
-parser.add_argument("--section_name", default="MasterBedroom", type=str)
-parser.add_argument("--platform_name", default="bed_01", type=str)
-parser.add_argument("--scene_start", default=19, type=int)
+parser.add_argument("--env_name", default="Manufactory", type=str)
+parser.add_argument("--section_name", default="Seongju_Melon_Processing_Facility", type=str)
+parser.add_argument("--platform_name", default="coating_machine_01", type=str)
+parser.add_argument("--scene_start", default=7, type=int)
 parser.add_argument("--pre_grasp_index", default=0, type=int, help=argparse.SUPPRESS)
 args = parser.parse_args()
 root_path = os.path.join(

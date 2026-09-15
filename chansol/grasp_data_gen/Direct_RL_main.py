@@ -1,21 +1,33 @@
 
 
 
-import argparse
 from isaaclab.app import AppLauncher
 import sys
+from pathlib import Path
 
-parser = argparse.ArgumentParser(description="Random agent for Isaac Lab environments.")
+# 새 수집기와 동일한 <dataset>/<object>/<gripper>/<data-type> 구조를 사용한다.
+DATASET_ROOT = Path("/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen")
+OBJECT_NAME = "black_pepper_shaker"
+GRIPPER_NAME = "Robotiq_2f140"
+SCENE_NUM = 0
 
-AppLauncher.add_app_launcher_args(parser)
-parser.add_argument("--scene-num", type=int, default=0, help="Scene index to process.")
-args_cli = parser.parse_args()
+# 기존 물리/그리퍼 설정은 유지한다. 비교 결과는 새 수집 결과와 섞이지 않게
+# output_grasp_legacy에 저장한다.
+GRIPPER_INFO = Path("/nas/ochansol/gripper_info/gripper_info.json")
+PRE_GRASP_DIR = "pre_grasp"
+CONF_DIR = "conf"
+OUTPUT_GRASP_DIR = "output_grasp_legacy"
+OVERWRITE = True
 
+HEADLESS = False
+DEVICE = "cuda:0"
 
-args_cli.headless =False
-debug = not args_cli.headless
-
-app_launcher = AppLauncher(args_cli)
+debug = not HEADLESS
+app_launcher = AppLauncher(
+    headless=HEADLESS,
+    device=DEVICE,
+    enable_cameras=False,
+)
 
 
 simulation_app = app_launcher.app
@@ -26,36 +38,37 @@ import Robot_EnvCfg as cs_robot
 from scene_cfg import scene_obj_setup, object_frame_transformer_setup
 import torch
 import json
-import os
 import time
 
-# object_name = "dslr_camera"
-object_name = "wireless_charging_stand"
-gripper_info_path = "/nas/ochansol/gripper_info/gripper_info.json"    
-root_path = f"/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/{object_name}"
-pre_grasp_path = "pre_grasp"
-output_grasp_path = "output_grasp"
-conf_path = "conf"
-scene_num = args_cli.scene_num
+root_path = DATASET_ROOT / OBJECT_NAME / GRIPPER_NAME
+pre_grasp_path = root_path / PRE_GRASP_DIR / f"{SCENE_NUM:04d}.json"
+conf_path = root_path / CONF_DIR / f"{SCENE_NUM:04d}.json"
+output_path = root_path / OUTPUT_GRASP_DIR / f"{SCENE_NUM:04d}.json"
+output_path.parent.mkdir(parents=True, exist_ok=True)
 
-if not os.path.isdir(os.path.join(root_path, output_grasp_path)):
-    os.makedirs(os.path.join(root_path, output_grasp_path))
+for required in (pre_grasp_path, conf_path, GRIPPER_INFO):
+    if not required.is_file():
+        raise FileNotFoundError(required)
 
 output_list = []
 output_list_tmp = []
-if os.path.exists(f"{root_path}/{output_grasp_path}/{scene_num:04d}.json"):
-    with open(f"{root_path}/{output_grasp_path}/{scene_num:04d}.json", "r") as f:
+if output_path.exists() and not OVERWRITE:
+    with output_path.open("r", encoding="utf-8") as f:
         output_list = json.load(f)
 
-with open(os.path.join(root_path, pre_grasp_path, f"{scene_num:04d}.json"), "r") as f:
+with pre_grasp_path.open("r", encoding="utf-8") as f:
     pre_grasp_data = json.load(f)
-with open(os.path.join(root_path, conf_path, f"{scene_num:04d}.json"), "r") as f:
+with conf_path.open("r", encoding="utf-8") as f:
     conf_data = json.load(f)
-with open(gripper_info_path, "r") as f:
+with GRIPPER_INFO.open("r", encoding="utf-8") as f:
     gripper_info = json.load(f)
 if isinstance(pre_grasp_data, list):
     pre_grasp_data = pre_grasp_data[0]
 gripper_name = pre_grasp_data["gripper_model"]
+if gripper_name != GRIPPER_NAME:
+    raise ValueError(
+        f"Folder gripper {GRIPPER_NAME!r} does not match pregrasp {gripper_name!r}"
+    )
 
 
 env_cfg = cs_robot.RobotEnvCfg()
@@ -74,7 +87,7 @@ env = cs_robot.RobotEnv(cfg=env_cfg, pre_grasp_data=pre_grasp_data["data"], conf
 count = 0
 obs, _ = env.reset()
 print("Grasp > START")
-print(f"Grasp > SCENE:{scene_num}")
+print(f"Grasp > SCENE:{SCENE_NUM}")
 
 
 old_time = time.time()
@@ -96,7 +109,7 @@ while simulation_app.is_running():
 
             output_list += output_list_tmp
             sorted_output_list = sorted(output_list, key=lambda x: x["target_object"])
-            with open(f"{root_path}/{output_grasp_path}/{scene_num:04d}.json", "w") as f:
+            with output_path.open("w", encoding="utf-8") as f:
                 json.dump(sorted_output_list, f, indent=4)
             break
 

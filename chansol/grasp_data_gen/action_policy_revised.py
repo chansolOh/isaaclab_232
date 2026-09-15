@@ -142,7 +142,15 @@ class ActionPolicy:
 
         if debug: self.draw = _debug_draw.acquire_debug_draw_interface()
 
-        self.top_cam_config = [i for i in self.conf_data["cameras"] if i["name"]=="top_view_camera"][0]
+        # New single-object conf files intentionally omit cameras. The camera
+        # is only needed by the currently-unused 2-D bbox projection path, so
+        # allow the legacy grasp physics/quality path to run without it.
+        top_cameras = [
+            camera
+            for camera in self.conf_data.get("cameras", [])
+            if camera.get("name") == "top_view_camera"
+        ]
+        self.top_cam_config = top_cameras[0] if top_cameras else None
 
         self.object_pos_org = torch.tensor([obj["translate"] for obj in self.obj_conf_data], dtype=torch.float, device=self.device)
         self.object_rot_org = torch.tensor([mat_utils.euler_to_quat(self.obj_conf_data[i]["orient"], degrees=True) for i in range(len(self.obj_conf_data))], dtype=torch.float, device=self.device)
@@ -183,7 +191,22 @@ class ActionPolicy:
         if self.type == "finger2_parallel":
 
 
-            width = torch.tensor([[self.gripper_tool.get_width(joint_angle_deg = joint_i/torch.pi*180)/2 for joint_i in joint] for joint in joints], dtype=torch.float, device=self.device)
+            width = torch.tensor(
+                [
+                    [
+                        self.gripper_tool.get_width(
+                            joint_angle_deg=float(joint_i.detach().cpu())
+                            / torch.pi
+                            * 180
+                        )
+                        / 2
+                        for joint_i in joint
+                    ]
+                    for joint in joints
+                ],
+                dtype=torch.float,
+                device=self.device,
+            )
 
             width_tensor = torch.zeros((len(idx),4,3),device=self.device)
 
@@ -243,9 +266,32 @@ class ActionPolicy:
         joints = self.joint_pos[idx][...,self.joint_index].clone()
 
         if self.type == "finger2_parallel":
-            z_hop = self.gripper_tool.get_z(joint_angle_deg = joints[...,0]/torch.pi*180)
+            z_hop = torch.as_tensor(
+                self.gripper_tool.get_z(
+                    joint_angle_deg=(
+                        joints[..., 0].detach().cpu().numpy() / torch.pi * 180
+                    )
+                ),
+                dtype=torch.float,
+                device=self.device,
+            )
 
-            width = torch.tensor([[self.gripper_tool.get_width(joint_angle_deg = joint_i/torch.pi*180)/2 for joint_i in joint] for joint in joints], dtype=torch.float, device=self.device)
+            width = torch.tensor(
+                [
+                    [
+                        self.gripper_tool.get_width(
+                            joint_angle_deg=float(joint_i.detach().cpu())
+                            / torch.pi
+                            * 180
+                        )
+                        / 2
+                        for joint_i in joint
+                    ]
+                    for joint in joints
+                ],
+                dtype=torch.float,
+                device=self.device,
+            )
 
             width_tensor = torch.zeros((len(idx),4,3),device=self.device)
 
@@ -364,6 +410,8 @@ class ActionPolicy:
         self.restored_force_normal[idx] = restored_force_normal
     
     def bbox_3d_to_2d(self, bbox):
+        if self.top_cam_config is None:
+            raise RuntimeError("bbox_3d_to_2d requires a top_view_camera in conf")
         bbox = torch.concat((bbox, torch.ones((len(bbox),4,1), device=self.device)), dim=2 ).transpose(1,2)
         cam_tf = np.linalg.inv(np.array(self.top_cam_config["cam_poses"]).dot(mat_utils.rot_x(180)))
         cam_intrinsic_mat = mat_utils.mat_to_tf(torch.tensor(self.top_cam_config["intrinsic_isaac"],device=self.device ))
@@ -680,7 +728,13 @@ class ActionPolicy:
             self.stage_action_arr[idx_arr,2,joint_offset + 1] = self.close_l_joint
 
         elif self.type == "finger2_parallel":
-            joint_deg = self.gripper_tool.get_joint_angle(self.total_width[idx])
+            joint_deg = torch.as_tensor(
+                self.gripper_tool.get_joint_angle(
+                    self.total_width[idx].detach().cpu().numpy()
+                ),
+                dtype=torch.float,
+                device=self.device,
+            )
             # width = torch.arcsin( ( self.total_width[idx]/2 +self.gripper_info["finger_joint_thickness"]- self.gripper_info["outer_link_offset"]) /self.gripper_info["outer_link_length"]).abs()
             # r_joint_arr = (1 if self.close_r_joint<0 else -1)* width + self.gripper_info["zero_deg_r_joint"]/180*torch.pi
             # l_joint_arr = (1 if self.close_l_joint<0 else -1)* width + self.gripper_info["zero_deg_l_joint"]/180*torch.pi
