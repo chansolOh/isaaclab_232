@@ -31,6 +31,7 @@ SCENE_START: int | None = None
 SCENE_END: int | None = None
 
 SCORE_THRESHOLD = 0.25
+REQUIRE_COMPLETED = True
 MESH_UNIT_SCALE = 0.01
 BOX_THICKNESS = 0.02
 BOX_MARGIN = 0.002
@@ -257,6 +258,11 @@ def main() -> None:
         obj = conf["objects"][0]
         reference_obj = reference_obj or obj
         for item in load_json(ROOT / "output_grasp" / f"{scene_id}.json"):
+            if (
+                REQUIRE_COMPLETED
+                and item.get("quality", {}).get("result") != "completed"
+            ):
+                continue
             if float(item.get("score", 0.0)) < SCORE_THRESHOLD:
                 continue
             transformed = to_zero_pose(item, obj, scene_id)

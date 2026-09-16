@@ -166,6 +166,13 @@ PhysX 전체 버퍼는 설치된 Isaac Lab의 표준 용량을 사용한다.
 pre-grasp 위치에서 접근하고 닫은 뒤, 들어 올리는 단계 없이 현재 위치에서 바로
 임의 방향 증가 하중 시험을 수행한다. 각 grasp에는 `score`, `rotation_score`, stress 생존율,
 최대 시험 하중, 상대 위치/회전 오차와 contact force가 저장된다.
+외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
+상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
+contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
+사라지면 각각 `stress_drop` / `contact_lost` 실패로 처리한다.
+실패는 `*.attempts.json`에만 남고 `output_grasp` 성공 데이터에는
+저장하지 않는다. 기존 output을 병합할 때도
+`merge_grasps.py` 기본값 `REQUIRE_COMPLETED = True`가 실패 record를 제외한다.
 저장된 grasp의 `quality.minimum_contact_separation_m`에는 전체 시험 중 가장 깊었던
 손-물체 contact separation도 함께 저장된다(음수는 겹침 깊이).
 `quality.minimum_close_contact_separation_m`에는 닫힘 구간만의 최솟값이,
@@ -176,7 +183,30 @@ pre-grasp 위치에서 접근하고 닫은 뒤, 들어 올리는 단계 없이 �
 스위치 상태가 저장된다. 이 separation은 action step의 마지막 값뿐 아니라
 `DECIMATION` 사이의 각 physics substep 최솟값도 포함한다.
 
-## 3. grasp 병합
+## 3. grasp 개별 physics replay
+
+`replay_grasps.py` 상단의 `ROOT`, `SCENE`, `DEVICE`, grasp 범위를
+설정한 뒤 실행한다.
+
+```bash
+/home/uon/ochansol/isaaclab_232/.venv/bin/python replay_grasps.py
+```
+
+`output_grasp/<scene>.json`의 저장 순서로 하나씩 재생한다.
+각 grasp의 `source_pregrasp_index`로 원본 pregrasp를 찾고, 접근→닫기→외력
+시험을 다시 수행하며 저장된 `normal`을 같은 외력 방향으로 사용한다.
+종료되면 마지막 물리 상태에서 자동 reset하지 않고 멈춘다.
+Isaac Sim debug draw로 저장된 `grasp_box`를 빨간/점수 색 선으로,
+`normal`을 자주색 선으로, `grasp_mat` frame을 RGB 축으로,
+`target_points`를 노란색 점으로 함께 표시한다. 다음 grasp로 넘어가면
+기존 debug draw를 지우고 새 데이터로 갱신한다.
+
+- `N` / `Right` / `Space`: 다음 grasp
+- `P` / `Left`: 이전 grasp
+- `R`: 현재 grasp 다시 재생
+- `Q` / `Esc`: 종료
+
+## 4. grasp 병합
 
 ```bash
 python3 merge_grasps.py

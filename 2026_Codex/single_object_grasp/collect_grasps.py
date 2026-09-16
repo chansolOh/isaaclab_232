@@ -65,6 +65,10 @@ def main(
     # APPROACH/CLOSE 중 물체가 초기 pose에서 이 이상 이동하면 transient
     # contact report 유무와 관계없이 충돌 실패로 처리한다.
     PRE_STRESS_OBJECT_MOTION_THRESHOLD = 0.1
+    # 외력 시험 중 이 범위를 넘게 미끄러지거나 접촉을 연속 상실하면 실패다.
+    MAX_RELATIVE_TRANSLATION_M = 0.010
+    MAX_RELATIVE_ROTATION_DEG = 20.0
+    CONTACT_LOST_DURATION_S = 0.10
     CONTACT_MAX_DATA_COUNT_PER_PRIM = 4096
     PRINT_CONTACT_SEPARATION = False
     CONTACT_SEPARATION_PRINT_DELTA_MM = 1.0
@@ -163,6 +167,10 @@ def main(
             raise ValueError("CONTACT_OFFSET_MM must exceed both zero and REST_OFFSET_MM")
         if CONTACT_PENETRATION_THRESHOLD_MM < 0.0:
             raise ValueError("CONTACT_PENETRATION_THRESHOLD_MM must be non-negative")
+        if MAX_RELATIVE_TRANSLATION_M <= 0.0 or MAX_RELATIVE_ROTATION_DEG <= 0.0:
+            raise ValueError("Stress-test drift thresholds must be positive")
+        if CONTACT_LOST_DURATION_S <= 0.0:
+            raise ValueError("CONTACT_LOST_DURATION_S must be positive")
         if CONTACT_MAX_DATA_COUNT_PER_PRIM < 1:
             raise ValueError("CONTACT_MAX_DATA_COUNT_PER_PRIM must be at least 1")
         if ROOT_MAX_LINEAR_SPEED <= 0.0 or ROOT_MAX_ANGULAR_SPEED_DEG <= 0.0:
@@ -203,6 +211,9 @@ def main(
         cfg.pre_stress_object_motion_threshold = float(
             PRE_STRESS_OBJECT_MOTION_THRESHOLD
         )
+        cfg.max_relative_translation = float(MAX_RELATIVE_TRANSLATION_M)
+        cfg.max_relative_rotation_deg = float(MAX_RELATIVE_ROTATION_DEG)
+        cfg.contact_lost_duration = float(CONTACT_LOST_DURATION_S)
         cfg.contact_max_data_count_per_prim = int(CONTACT_MAX_DATA_COUNT_PER_PRIM)
         cfg.print_contact_separation = bool(PRINT_CONTACT_SEPARATION)
         cfg.contact_separation_print_delta = (

@@ -110,9 +110,10 @@ class GraspPolicy:
         close_timeout: float = 1.5,
         stress_duration: float = 1.2,
         grasp_blocked_error: float = 0.003,
-        max_relative_translation: float = 0.045,
-        max_relative_rotation_deg: float = 75.0,
+        max_relative_translation: float = 0.010,
+        max_relative_rotation_deg: float = 20.0,
         min_contact_force: float = 0.12,
+        contact_lost_duration: float = 0.10,
         contact_penetration_threshold: float = 0.005,
         pre_stress_object_motion_threshold: float = 0.005,
         apply_finger_z_hop: bool = False,
@@ -142,6 +143,9 @@ class GraspPolicy:
         self.max_relative_translation = float(max_relative_translation)
         self.max_relative_rotation = math.radians(float(max_relative_rotation_deg))
         self.min_contact_force = float(min_contact_force)
+        self.contact_lost_steps = max(
+            1, round(float(contact_lost_duration) / self.step_dt)
+        )
         self.contact_penetration_threshold = float(contact_penetration_threshold)
         if self.contact_penetration_threshold < 0.0:
             raise ValueError("contact_penetration_threshold must be non-negative")
@@ -648,24 +652,26 @@ class GraspPolicy:
                 self.contact_lost_count[tested] + 1,
                 torch.zeros_like(self.contact_lost_count[tested]),
             )
-            # The relative pose is the authoritative retention measurement.
-            # ContactSensor may briefly report zero during constrained motion,
-            # so its value is retained as quality telemetry but is not by
-            # itself a stress failure.
             drifted = (
                 (position_error > self.max_relative_translation)
                 | (rotation_error > self.max_relative_rotation)
+            )
+            contact_lost = (
+                self.contact_lost_count[tested] >= self.contact_lost_steps
             )
             stress_envs = tested
             if len(stress_envs):
                 progress = (self.stage_step[stress_envs].float() / self.stress_steps).clamp(0, 1)
                 self.stress_survival[stress_envs] = progress
-                local_drift = drifted
-                failed = stress_envs[local_drift]
+                failed_contact = stress_envs[contact_lost]
+                failed_drift = stress_envs[drifted & ~contact_lost]
                 completed = stress_envs[
-                    ~local_drift & (self.stage_step[stress_envs] >= self.stress_steps)
+                    ~drifted
+                    & ~contact_lost
+                    & (self.stage_step[stress_envs] >= self.stress_steps)
                 ]
-                self._record(failed, "stress_drop")
+                self._record(failed_contact, "contact_lost")
+                self._record(failed_drift, "stress_drop")
                 self.stress_survival[completed] = 1.0
                 self._record(completed, "completed")
 
@@ -782,7 +788,10 @@ class GraspPolicy:
             ):
                 if key in source:
                     record[key] = copy.deepcopy(source[key])
-            self.output_list.append(record)
+            # output_grasp is a success dataset. Failed stress attempts belong
+            # only in attempt_history and must not become low-score grasps.
+            if result == "completed":
+                self.output_list.append(record)
             self.attempt_history.append(
                 {
                     "source_pregrasp_index": source_id,

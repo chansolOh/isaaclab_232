@@ -369,6 +369,9 @@ class RobotEnvCfg(DirectRLEnvCfg):
     enable_object_contact_sensor = True
     penetration_backend = "contact_sensor"
     pre_stress_object_motion_threshold = 0.1
+    max_relative_translation = 0.010
+    max_relative_rotation_deg = 20.0
+    contact_lost_duration = 0.10
     contact_max_data_count_per_prim = 256
     override_gripper_collision_offsets = False
     print_contact_separation = False
@@ -413,12 +416,17 @@ class RobotEnv(DirectRLEnv):
         pre_grasp_data: list[dict],
         conf_data: dict,
         debug: bool = False,
+        hold_completed: bool = False,
         **kwargs,
     ):
         self.pre_grasp_data = pre_grasp_data
         self.conf_data = conf_data
         self.debug = bool(debug)
+        self.hold_completed = bool(hold_completed)
         super().__init__(cfg, **kwargs)
+        self.replay_finished = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self._joint_indexes = torch.tensor(
             [self.robot.find_joints(name)[0][0] for name in cfg.joint_names],
             dtype=torch.long,
@@ -473,6 +481,9 @@ class RobotEnv(DirectRLEnv):
             pre_stress_object_motion_threshold=(
                 cfg.pre_stress_object_motion_threshold
             ),
+            max_relative_translation=cfg.max_relative_translation,
+            max_relative_rotation_deg=cfg.max_relative_rotation_deg,
+            contact_lost_duration=cfg.contact_lost_duration,
             apply_finger_z_hop=cfg.apply_finger_z_hop,
         )
         # Compatibility with the legacy main loop.
@@ -799,6 +810,12 @@ class RobotEnv(DirectRLEnv):
             applied_force=self.applied_force_n,
         )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if self.hold_completed:
+            # Interactive replay must keep the final simulated pose on screen.
+            # Suppress DirectRLEnv's automatic reset only for this opt-in mode.
+            self.replay_finished |= terminated | time_out
+            terminated = torch.zeros_like(terminated)
+            time_out = torch.zeros_like(time_out)
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -806,6 +823,8 @@ class RobotEnv(DirectRLEnv):
             env_ids = self.robot._ALL_INDICES
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         super()._reset_idx(env_ids)
+        if hasattr(self, "replay_finished"):
+            self.replay_finished[env_ids] = False
         self.policy.reset(env_ids)
         if hasattr(self, "_printed_sensor_separation"):
             self._printed_sensor_separation[:, env_ids] = torch.inf
@@ -866,6 +885,9 @@ class RobotEnv(DirectRLEnv):
             pre_stress_object_motion_threshold=(
                 self.cfg.pre_stress_object_motion_threshold
             ),
+            max_relative_translation=self.cfg.max_relative_translation,
+            max_relative_rotation_deg=self.cfg.max_relative_rotation_deg,
+            contact_lost_duration=self.cfg.contact_lost_duration,
             apply_finger_z_hop=self.cfg.apply_finger_z_hop,
         )
         self.act_pol = self.policy
