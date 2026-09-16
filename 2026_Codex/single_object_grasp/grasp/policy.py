@@ -18,9 +18,12 @@ STRESS = 2
 DONE = 3
 DISABLED = 4
 
-FORCE_SCORE_WEIGHT = 0.25
-PREGRASP_ROTATION_SCORE_WEIGHT = 0.50
-STRESS_ROTATION_SCORE_WEIGHT = 0.25
+FORCE_SCORE_WEIGHT = 0.4
+PREGRASP_POSE_SCORE_WEIGHT = 0.4
+STRESS_POSE_SCORE_WEIGHT = 0.2
+CENTER_IN_POSE_WEIGHT = 0.5
+ROTATION_IN_POSE_WEIGHT = 0.5
+CENTER_SCORE_RANGE_M = 0.010
 ROTATION_SCORE_RANGE_RAD = math.pi
 
 
@@ -231,6 +234,11 @@ class GraspPolicy:
         self.stress_rotation_error = torch.zeros(
             e, dtype=torch.float, **kwargs
         )
+        self.pregrasp_center_error = torch.zeros(e, dtype=torch.float, **kwargs)
+        self.stress_center_error = torch.zeros(e, dtype=torch.float, **kwargs)
+        self.stress_start_object_pos = torch.zeros(
+            (e, 3), dtype=torch.float, **kwargs
+        )
         self.stress_start_object_quat = torch.zeros(
             (e, 4), dtype=torch.float, **kwargs
         )
@@ -362,6 +370,9 @@ class GraspPolicy:
         self.maximum_pre_stress_object_motion[active] = 0.0
         self.pregrasp_rotation_error[active] = 0.0
         self.stress_rotation_error[active] = 0.0
+        self.pregrasp_center_error[active] = 0.0
+        self.stress_center_error[active] = 0.0
+        self.stress_start_object_pos[active] = 0.0
         self.stress_start_object_quat[active] = 0.0
         self.stress_start_object_quat[active, 0] = 1.0
         self.applied_z_hop[active] = 0.0
@@ -490,11 +501,17 @@ class GraspPolicy:
         )
         self.reference_rel_pos[env_ids] = rel_pos
         self.reference_rel_quat[env_ids] = rel_quat
+        grasped_object_pos = object_pos[env_ids]
         grasped_object_quat = normalize_quaternion(object_quat[env_ids])
+        self.stress_start_object_pos[env_ids] = grasped_object_pos
         self.stress_start_object_quat[env_ids] = grasped_object_quat
+        self.pregrasp_center_error[env_ids] = torch.linalg.vector_norm(
+            grasped_object_pos - self.object_initial_pos[env_ids], dim=1
+        )
         self.pregrasp_rotation_error[env_ids] = quaternion_angle(
             grasped_object_quat, self.object_initial_quat[env_ids]
         )
+        self.stress_center_error[env_ids] = 0.0
         self.stress_rotation_error[env_ids] = 0.0
         # Pin the stress test to the pose PhysX actually reached. Root motion
         # is speed-limited, so this can differ slightly from the command pose.
@@ -673,6 +690,9 @@ class GraspPolicy:
             rotation_error = quaternion_angle(rel_quat, self.reference_rel_quat[tested])
             self.relative_translation_error[tested] = position_error
             self.relative_rotation_error[tested] = rotation_error
+            self.stress_center_error[tested] = torch.linalg.vector_norm(
+                object_pos[tested] - self.stress_start_object_pos[tested], dim=1
+            )
             self.stress_rotation_error[tested] = quaternion_angle(
                 object_quat[tested], self.stress_start_object_quat[tested]
             )
@@ -771,20 +791,49 @@ class GraspPolicy:
                 1.0,
                 max(0.0, float(self.stress_survival[env_id])),
             )
+            pregrasp_center_score = min(
+                1.0,
+                max(
+                    0.0,
+                    1.0
+                    - float(self.pregrasp_center_error[env_id])
+                    / CENTER_SCORE_RANGE_M,
+                ),
+            )
+            stress_center_score = min(
+                1.0,
+                max(
+                    0.0,
+                    1.0
+                    - float(self.stress_center_error[env_id])
+                    / CENTER_SCORE_RANGE_M,
+                ),
+            )
+            pregrasp_pose_score = (
+                CENTER_IN_POSE_WEIGHT * pregrasp_center_score
+                + ROTATION_IN_POSE_WEIGHT * pregrasp_rotation_score
+            )
+            stress_pose_score = (
+                CENTER_IN_POSE_WEIGHT * stress_center_score
+                + ROTATION_IN_POSE_WEIGHT * stress_rotation_score
+            )
             score = (
                 FORCE_SCORE_WEIGHT * survival
-                + PREGRASP_ROTATION_SCORE_WEIGHT * pregrasp_rotation_score
-                + STRESS_ROTATION_SCORE_WEIGHT * stress_rotation_score
+                + PREGRASP_POSE_SCORE_WEIGHT * pregrasp_pose_score
+                + STRESS_POSE_SCORE_WEIGHT * stress_pose_score
             )
-            # Compatibility field for visualization/legacy readers. This is
-            # the two rotation components normalized by their total 0.75 weight.
+            # Compatibility field for readers that still visualize rotation only.
             rotation_score = (
-                PREGRASP_ROTATION_SCORE_WEIGHT * pregrasp_rotation_score
-                + STRESS_ROTATION_SCORE_WEIGHT * stress_rotation_score
+                PREGRASP_POSE_SCORE_WEIGHT * pregrasp_rotation_score
+                + STRESS_POSE_SCORE_WEIGHT * stress_rotation_score
             ) / (
-                PREGRASP_ROTATION_SCORE_WEIGHT
-                + STRESS_ROTATION_SCORE_WEIGHT
+                PREGRASP_POSE_SCORE_WEIGHT
+                + STRESS_POSE_SCORE_WEIGHT
             )
+            pose_score = (
+                PREGRASP_POSE_SCORE_WEIGHT * pregrasp_pose_score
+                + STRESS_POSE_SCORE_WEIGHT * stress_pose_score
+            ) / (PREGRASP_POSE_SCORE_WEIGHT + STRESS_POSE_SCORE_WEIGHT)
             quaternion = self.end_quat[env_id]
             matrix = torch.eye(4, dtype=torch.float, device=self.device)
             matrix[:3, :3] = quaternion_to_matrix(quaternion)
@@ -803,7 +852,12 @@ class GraspPolicy:
                 "gripper_type": self.gripper["type"],
                 "score": round(score, 6),
                 "rotation_score": round(rotation_score, 6),
+                "pose_score": round(pose_score, 6),
                 "force_score": round(survival, 6),
+                "pregrasp_pose_score": round(pregrasp_pose_score, 6),
+                "stress_pose_score": round(stress_pose_score, 6),
+                "pregrasp_center_score": round(pregrasp_center_score, 6),
+                "stress_center_score": round(stress_center_score, 6),
                 "pregrasp_rotation_score": round(pregrasp_rotation_score, 6),
                 "stress_rotation_score": round(stress_rotation_score, 6),
                 "normal": self.force_direction[env_id].detach().cpu().numpy().round(7).tolist(),
@@ -812,9 +866,14 @@ class GraspPolicy:
                     "test_sequence": "close_then_stress",
                     "score_weights": {
                         "force": FORCE_SCORE_WEIGHT,
-                        "pregrasp_rotation": PREGRASP_ROTATION_SCORE_WEIGHT,
-                        "stress_rotation": STRESS_ROTATION_SCORE_WEIGHT,
+                        "pregrasp_pose": PREGRASP_POSE_SCORE_WEIGHT,
+                        "stress_pose": STRESS_POSE_SCORE_WEIGHT,
                     },
+                    "pose_component_weights": {
+                        "center": CENTER_IN_POSE_WEIGHT,
+                        "rotation": ROTATION_IN_POSE_WEIGHT,
+                    },
+                    "center_score_range_m": CENTER_SCORE_RANGE_M,
                     "rotation_score_range_deg": math.degrees(
                         ROTATION_SCORE_RANGE_RAD
                     ),
@@ -837,6 +896,12 @@ class GraspPolicy:
                             float(self.stress_rotation_error[env_id])
                         ),
                         5,
+                    ),
+                    "pregrasp_center_error_m": round(
+                        float(self.pregrasp_center_error[env_id]), 7
+                    ),
+                    "stress_center_error_m": round(
+                        float(self.stress_center_error[env_id]), 7
                     ),
                     "contact_force_n": round(float(self.last_contact_force[env_id]), 6),
                     "minimum_contact_separation_m": self._minimum_separation_value(
@@ -875,6 +940,10 @@ class GraspPolicy:
                     "result": result,
                     "score": score,
                     "force_score": survival,
+                    "pregrasp_pose_score": pregrasp_pose_score,
+                    "stress_pose_score": stress_pose_score,
+                    "pregrasp_center_score": pregrasp_center_score,
+                    "stress_center_score": stress_center_score,
                     "pregrasp_rotation_score": pregrasp_rotation_score,
                     "stress_rotation_score": stress_rotation_score,
                     "relative_translation_error_m": float(
@@ -888,6 +957,12 @@ class GraspPolicy:
                     ),
                     "stress_rotation_error_deg": math.degrees(
                         float(self.stress_rotation_error[env_id])
+                    ),
+                    "pregrasp_center_error_m": float(
+                        self.pregrasp_center_error[env_id]
+                    ),
+                    "stress_center_error_m": float(
+                        self.stress_center_error[env_id]
                     ),
                     "contact_force_n": float(self.last_contact_force[env_id]),
                     "minimum_contact_separation_m": self._minimum_separation_value(

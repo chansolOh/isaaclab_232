@@ -225,6 +225,9 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
     rotation_scores = np.asarray(
         [item.get("rotation_score", np.nan) for item in items], dtype=np.float32
     )
+    pose_scores = np.asarray(
+        [item.get("pose_score", np.nan) for item in items], dtype=np.float32
+    )
     force_scores = np.asarray(
         [item.get("force_score", np.nan) for item in items], dtype=np.float32
     )
@@ -234,6 +237,22 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
     )
     stress_rotation_scores = np.asarray(
         [item.get("stress_rotation_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
+    pregrasp_pose_scores = np.asarray(
+        [item.get("pregrasp_pose_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
+    stress_pose_scores = np.asarray(
+        [item.get("stress_pose_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
+    pregrasp_center_scores = np.asarray(
+        [item.get("pregrasp_center_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
+    stress_center_scores = np.asarray(
+        [item.get("stress_center_score", np.nan) for item in items],
         dtype=np.float32,
     )
     normals = np.asarray(
@@ -249,7 +268,12 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
         rotation_matrix=matrices[:, :3, :3],
         score=scores,
         rotation_score=rotation_scores,
+        pose_score=pose_scores,
         force_score=force_scores,
+        pregrasp_pose_score=pregrasp_pose_scores,
+        stress_pose_score=stress_pose_scores,
+        pregrasp_center_score=pregrasp_center_scores,
+        stress_center_score=stress_center_scores,
         pregrasp_rotation_score=pregrasp_rotation_scores,
         stress_rotation_score=stress_rotation_scores,
         normal=normals,

@@ -122,7 +122,9 @@ def draw_saved_grasp(draw, grasp: dict) -> None:
         return
     box = [tuple(float(value) for value in point) for point in raw_box]
     red = (1.0, 0.12, 0.05, 1.0)
-    score_color = rotation_score_color(grasp.get("rotation_score", 1.0))
+    score_color = rotation_score_color(
+        grasp.get("pose_score", grasp.get("rotation_score", 1.0))
+    )
 
     # Same three edges as grasp_data_viz.py. The center edge color represents
     # rotation_score; the two finger-side edges are red.
@@ -378,8 +380,8 @@ try:
             f"source_pregrasp={grasp['source_pregrasp_index']} "
             f"score={float(grasp.get('score', 0.0)):.6f} "
             f"(force={float(grasp.get('force_score', 0.0)):.4f}, "
-            f"pregrasp_rot={float(grasp.get('pregrasp_rotation_score', 0.0)):.4f}, "
-            f"stress_rot={float(grasp.get('stress_rotation_score', 0.0)):.4f})",
+            f"pregrasp_pose={float(grasp.get('pregrasp_pose_score', 0.0)):.4f}, "
+            f"stress_pose={float(grasp.get('stress_pose_score', 0.0)):.4f})",
             flush=True,
         )
         print(

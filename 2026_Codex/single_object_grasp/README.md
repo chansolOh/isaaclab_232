@@ -167,19 +167,20 @@ pre-grasp 위치에서 접근하고 닫은 뒤, 들어 올리는 단계 없이 �
 임의 방향 증가 하중 시험을 수행한다. 최종 점수는 다음 세 성분의 가중합이며
 항상 0~1 범위다.
 
-- 외력을 버틴 비율 `force_score`: 25%
-- scene 초기 물체 자세와 외력 시험 직전 파지된 물체 자세의 회전 차이
-  `pregrasp_rotation_score`: 50%
-- 외력 시험 직전 물체 자세와 외력 시험 종료 시점 물체 자세의 회전 차이
-  `stress_rotation_score`: 25%
+- 외력을 버틴 비율 `force_score`: 40%
+- scene 초기 물체 자세와 외력 시험 직전 파지된 물체 자세의 차이
+  `pregrasp_pose_score`: 40%
+- 외력 시험 직전 물체 자세와 외력 시험 종료 시점 물체 자세의 차이
+  `stress_pose_score`: 20%
 
-두 회전 성분은 위치 이동을 사용하지 않고 quaternion의 최단 회전각만 사용하며,
-`clamp(1 - 두 자세의 회전각 차이 / 180도, 0, 1)`로 계산한다. 따라서 공식은
-`score = 0.25*force_score + 0.50*pregrasp_rotation_score +
-0.25*stress_rotation_score`다. 회전 변화가 없으면 회전 점수는 1이며,
-회전 변화가 클수록 0에 가까워진다. 각 grasp에는
-세 성분 점수, 두 시점 사이의 회전각, stress 생존율, 최대 시험 하중,
-상대 위치/회전 오차와 contact force가 저장된다.
+각 자세 점수는 center 점수 50%와 회전 점수 50%의 평균이다. center 점수는
+`clamp(1 - center 이동거리 / 10 mm, 0, 1)`, 회전 점수는 quaternion의
+최단 회전각을 사용한 `clamp(1 - 회전각 차이 / 180도, 0, 1)`이다.
+따라서 center와 회전 변화가 모두 없으면 자세 점수는 1이며, 변화가 클수록
+0에 가까워진다. 최종 공식은 `score = 0.40*force_score +
+0.40*pregrasp_pose_score + 0.20*stress_pose_score`다. 각 grasp에는
+자세 및 하위 center/회전 점수, 두 시점 사이의 center 거리와 회전각,
+stress 생존율, 최대 시험 하중, 상대 위치/회전 오차와 contact force가 저장된다.
 외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
 상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
 contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
