@@ -135,6 +135,9 @@ def to_zero_pose(item: dict, obj_conf: dict, scene_id: str) -> dict | None:
     inverse = np.linalg.inv(object_pose_matrix(obj_conf))
     result = copy.deepcopy(item)
     result["grasp_box"] = transform_points(inverse, box).round(7).tolist()
+    boxes = np.asarray(item.get("grasp_boxes", []), dtype=np.float64)
+    if boxes.ndim == 3 and boxes.shape[1:] == (4, 3):
+        result["grasp_boxes"] = transform_points(inverse, boxes).round(7).tolist()
     if "grasp_mat" in item:
         matrix = np.asarray(item["grasp_mat"], dtype=np.float64)
         if matrix.shape == (4, 4):
@@ -180,6 +183,17 @@ def mesh_in_box(points: np.ndarray, box: np.ndarray, thickness: float, margin: f
     )
 
 
+def grasp_boxes(item: dict) -> np.ndarray:
+    """Return exact per-finger boxes, with a legacy single-box fallback."""
+    boxes = np.asarray(item.get("grasp_boxes", []), dtype=np.float64)
+    if boxes.ndim == 3 and boxes.shape[1:] == (4, 3) and len(boxes) > 0:
+        return boxes
+    box = np.asarray(item.get("grasp_box", []), dtype=np.float64)
+    if box.shape != (4, 3):
+        return np.zeros((0, 4, 3), dtype=np.float64)
+    return box[None]
+
+
 def rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
     relative = first.T @ second
     cosine = np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0)
@@ -217,6 +231,19 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
     boxes = np.asarray(
         [item["grasp_box"] for item in items], dtype=np.float32
     ).reshape(-1, 4, 3)
+    box_groups = [
+        np.asarray(
+            item.get("grasp_boxes", [item["grasp_box"]]), dtype=np.float32
+        ).reshape(-1, 4, 3)
+        for item in items
+    ]
+    box_offsets = np.zeros(len(box_groups) + 1, dtype=np.int64)
+    box_offsets[1:] = np.cumsum([len(group) for group in box_groups])
+    boxes_flat = (
+        np.concatenate(box_groups, axis=0)
+        if box_groups
+        else np.zeros((0, 4, 3), dtype=np.float32)
+    )
     matrices = np.asarray(
         [item["grasp_mat"] for item in items], dtype=np.float32
     ).reshape(-1, 4, 4)
@@ -267,6 +294,8 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
         temporary,
         metadata_json=np.asarray(json.dumps(metadata)),
         grasp_box=boxes,
+        grasp_boxes_flat=boxes_flat,
+        grasp_boxes_offsets=box_offsets,
         grasp_mat=matrices,
         grasp_center=centers,
         rotation_matrix=matrices[:, :3, :3],
@@ -324,11 +353,9 @@ def main() -> None:
         merged = [
             item
             for item in merged
-            if mesh_in_box(
-                vertices,
-                np.asarray(item["grasp_box"]),
-                BOX_THICKNESS,
-                BOX_MARGIN,
+            if any(
+                mesh_in_box(vertices, box, BOX_THICKNESS, BOX_MARGIN)
+                for box in grasp_boxes(item)
             )
         ]
     after_empty = len(merged)

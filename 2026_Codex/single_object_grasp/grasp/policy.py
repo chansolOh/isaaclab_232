@@ -742,26 +742,100 @@ class GraspPolicy:
 
         return (self.action_enable == 1) & (self.stage_num == DONE)
 
-    def _grasp_box(self, source: dict) -> np.ndarray:
+    def _grasp_boxes(self, source: dict) -> np.ndarray:
+        """Return every world-frame contact bbox for this gripper grasp."""
+        center = np.asarray(source["target_points"], dtype=np.float64)
+        yaw = math.radians(float(source["target_orientation"][2]))
+        if self.is_hand:
+            boxes = np.asarray(source.get("grasp_bbox", []), dtype=np.float64)
+            if boxes.ndim != 3 or boxes.shape[1:] != (4, 3) or len(boxes) == 0:
+                raise ValueError(
+                    "Hand pre-grasp grasp_bbox must have shape (N, 4, 3), "
+                    f"got {boxes.shape}"
+                )
+            return boxes
+
+        half_height = float(self.gripper["height"]) * 0.5
+        attempted_width = float(source["target_width"])
+        if self.gripper_type.startswith("finger2"):
+            boxes = np.asarray(
+                [[
+                    [half_height, -attempted_width * 0.5, 0.0],
+                    [-half_height, -attempted_width * 0.5, 0.0],
+                    [-half_height, attempted_width * 0.5, 0.0],
+                    [half_height, attempted_width * 0.5, 0.0],
+                ]],
+                dtype=np.float64,
+            )
+        elif self.gripper_type.startswith("finger3"):
+            infos = self.gripper.get("finger_bbox_info")
+            if not isinstance(infos, list) or not infos:
+                raise ValueError(
+                    f"{self.gripper.get('gripper_name')} requires finger_bbox_info"
+                )
+            base = np.asarray(
+                [
+                    [half_height, -attempted_width * 0.5, 0.0],
+                    [-half_height, -attempted_width * 0.5, 0.0],
+                    [-half_height, 0.0, 0.0],
+                    [half_height, 0.0, 0.0],
+                ],
+                dtype=np.float64,
+            )
+            boxes = []
+            for info in infos:
+                finger_yaw = math.radians(float(info["rot"]))
+                finger_rotation = np.asarray(
+                    [
+                        [math.cos(finger_yaw), -math.sin(finger_yaw)],
+                        [math.sin(finger_yaw), math.cos(finger_yaw)],
+                    ],
+                    dtype=np.float64,
+                )
+                box = base.copy()
+                box[:, :2] = (
+                    box[:, :2] @ finger_rotation.T
+                    + np.asarray(info["pos"][:2], dtype=np.float64)
+                )
+                boxes.append(box)
+            boxes = np.asarray(boxes, dtype=np.float64)
+        else:
+            raise ValueError(f"Unsupported gripper type for bbox: {self.gripper_type}")
+
+        grasp_rotation = np.asarray(
+            [
+                [math.cos(yaw), -math.sin(yaw)],
+                [math.sin(yaw), math.cos(yaw)],
+            ],
+            dtype=np.float64,
+        )
+        boxes[:, :, :2] = boxes[:, :, :2] @ grasp_rotation.T
+        boxes += center[None, None, :]
+        return boxes
+
+    def _enclosing_grasp_box(
+        self, source: dict, boxes: np.ndarray
+    ) -> np.ndarray:
+        """One compatibility rectangle enclosing all multi-finger bboxes."""
+        if len(boxes) == 1:
+            return boxes[0]
         center = np.asarray(source["target_points"], dtype=np.float64)
         yaw = math.radians(float(source["target_orientation"][2]))
         x_axis = np.asarray([math.cos(yaw), math.sin(yaw), 0.0])
         y_axis = np.asarray([-math.sin(yaw), math.cos(yaw), 0.0])
-        if self.is_hand and source.get("grasp_bbox"):
-            points = np.asarray(source["grasp_bbox"], dtype=np.float64).reshape(-1, 3)
-            relative = points - center
-            half_x = max(0.005, float(np.max(np.abs(relative @ x_axis))))
-            half_y = max(0.005, float(np.max(np.abs(relative @ y_axis))))
-        else:
-            half_x = float(self.gripper["height"]) * 0.5
-            half_y = float(source["target_width"]) * 0.5
+        relative = boxes.reshape(-1, 3) - center
+        x_values = relative @ x_axis
+        y_values = relative @ y_axis
+        minimum_x, maximum_x = float(x_values.min()), float(x_values.max())
+        minimum_y, maximum_y = float(y_values.min()), float(y_values.max())
         return np.asarray(
             [
-                center + half_x * x_axis - half_y * y_axis,
-                center - half_x * x_axis - half_y * y_axis,
-                center - half_x * x_axis + half_y * y_axis,
-                center + half_x * x_axis + half_y * y_axis,
-            ]
+                center + maximum_x * x_axis + minimum_y * y_axis,
+                center + minimum_x * x_axis + minimum_y * y_axis,
+                center + minimum_x * x_axis + maximum_y * y_axis,
+                center + maximum_x * x_axis + maximum_y * y_axis,
+            ],
+            dtype=np.float64,
         )
 
     def _minimum_separation_value(self, env_id: int) -> float | None:
@@ -870,13 +944,16 @@ class GraspPolicy:
                 + STRESS_POSE_SCORE_WEIGHT * stress_pose_score
             ) / (PREGRASP_POSE_SCORE_WEIGHT + STRESS_POSE_SCORE_WEIGHT)
             quaternion = self.end_quat[env_id]
+            grasp_boxes = self._grasp_boxes(source)
+            grasp_box = self._enclosing_grasp_box(source, grasp_boxes)
             matrix = torch.eye(4, dtype=torch.float, device=self.device)
             matrix[:3, :3] = quaternion_to_matrix(quaternion)
             matrix[:3, 3] = torch.tensor(
                 source["target_points"], dtype=torch.float, device=self.device
             )
             record = {
-                "grasp_box": self._grasp_box(source).round(7).tolist(),
+                "grasp_box": grasp_box.round(7).tolist(),
+                "grasp_boxes": grasp_boxes.round(7).tolist(),
                 "grasp_mat": matrix.detach().cpu().numpy().round(7).tolist(),
                 "target_points": copy.deepcopy(source["target_points"]),
                 "target_orientation": copy.deepcopy(source["target_orientation"]),

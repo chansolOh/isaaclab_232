@@ -116,24 +116,46 @@ def draw_saved_grasp(draw, grasp: dict, score_field: str = "pose_score") -> None
     if not DRAW_GRASP_DATA:
         return
 
-    raw_box = grasp.get("grasp_box", [])
-    if len(raw_box) != 4 or any(len(point) != 3 for point in raw_box):
-        print("Replay draw > invalid grasp_box; skipped", flush=True)
+    raw_boxes = grasp.get("grasp_boxes")
+    if raw_boxes is None:
+        raw_box = grasp.get("grasp_box", [])
+        raw_boxes = [raw_box]
+    valid_boxes = (
+        isinstance(raw_boxes, list)
+        and len(raw_boxes) > 0
+        and all(
+            isinstance(box, list)
+            and len(box) == 4
+            and all(isinstance(point, list) and len(point) == 3 for point in box)
+            for box in raw_boxes
+        )
+    )
+    if not valid_boxes:
+        print("Replay draw > invalid grasp_boxes/grasp_box; skipped", flush=True)
         return
-    box = [tuple(float(value) for value in point) for point in raw_box]
+    boxes = [
+        [tuple(float(value) for value in point) for point in box]
+        for box in raw_boxes
+    ]
     red = (1.0, 0.12, 0.05, 1.0)
     score_color = rotation_score_color(
         grasp.get(score_field, grasp.get("score", 1.0))
     )
 
-    # Same three edges as grasp_data_viz.py. The center edge color represents
-    # the active sort score; the two finger-side edges are red.
-    starts = [box[0], box[1], box[2]]
-    ends = [box[1], box[2], box[3]]
-    colors = [red, score_color, red]
-    widths = [float(GRASP_LINE_WIDTH)] * 3
+    # Draw every finger/fingertip contact rectangle. The second edge carries
+    # the active sort-score color and the remaining edges are red.
+    starts, ends, colors, widths = [], [], [], []
+    for box in boxes:
+        starts.extend([box[0], box[1], box[2], box[3]])
+        ends.extend([box[1], box[2], box[3], box[0]])
+        colors.extend([red, score_color, red, red])
+        widths.extend([float(GRASP_LINE_WIDTH)] * 4)
 
-    center = tuple(sum(point[axis] for point in box) / 4.0 for axis in range(3))
+    all_points = [point for box in boxes for point in box]
+    center = tuple(
+        sum(point[axis] for point in all_points) / len(all_points)
+        for axis in range(3)
+    )
     normal = grasp.get("normal")
     if isinstance(normal, list) and len(normal) == 3:
         normal = tuple(float(value) for value in normal)

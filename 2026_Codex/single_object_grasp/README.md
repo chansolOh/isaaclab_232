@@ -189,6 +189,11 @@ contact normal 방향별 평면 패치로 분리한 뒤 등가 직사각형으�
 자세 및 하위 center/회전 점수, 두 시점 사이의 center 거리와 회전각,
 추정 접촉 면적(m²/mm²), stress 생존율, 최대 시험 하중, 상대 위치/회전 오차와
 contact force가 저장된다.
+`grasp_boxes`에는 gripper 종류별 실제 파지 영역을 저장한다. 2-finger는 사각형
+1개, 3-finger는 `finger_bbox_info`를 적용한 손가락별 사각형, hand는 pregrasp의
+fingertip `grasp_bbox` 전체가 들어간다. 기존 도구 호환용 `grasp_box`에는 이들을
+모두 감싸는 대표 사각형을 유지한다. 병합 NPZ는 가변 개수를
+`grasp_boxes_flat`과 `grasp_boxes_offsets`로 저장한다.
 외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
 상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
 contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
