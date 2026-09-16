@@ -477,6 +477,7 @@ class RobotEnv(DirectRLEnv):
             object_initial_pos=(
                 self.obj00.data.default_root_state[:, :3] + self.scene.env_origins
             ),
+            object_initial_quat=self.obj00.data.default_root_state[:, 3:7],
             contact_penetration_threshold=cfg.contact_penetration_threshold,
             pre_stress_object_motion_threshold=(
                 cfg.pre_stress_object_motion_threshold
@@ -881,6 +882,7 @@ class RobotEnv(DirectRLEnv):
             object_initial_pos=(
                 self.obj00.data.default_root_state[:, :3] + self.scene.env_origins
             ),
+            object_initial_quat=self.obj00.data.default_root_state[:, 3:7],
             contact_penetration_threshold=self.cfg.contact_penetration_threshold,
             pre_stress_object_motion_threshold=(
                 self.cfg.pre_stress_object_motion_threshold

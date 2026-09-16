@@ -15,7 +15,8 @@ from isaaclab.app import AppLauncher
 # -----------------------------------------------------------------------------
 ROOT = Path(
     "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/"
-    "black_pepper_shaker/UON_3finger_gripper"
+    "black_pepper_shaker/"
+    "Robotiq_2f140"#"UON_3finger_gripper"
 )
 SCENE = 0
 
@@ -375,7 +376,10 @@ try:
             f"grasp={output_index + 1}/{len(all_grasps)} "
             f"selected={index + 1}/{len(selected_grasps)} "
             f"source_pregrasp={grasp['source_pregrasp_index']} "
-            f"score={float(grasp.get('score', 0.0)):.6f}",
+            f"score={float(grasp.get('score', 0.0)):.6f} "
+            f"(force={float(grasp.get('force_score', 0.0)):.4f}, "
+            f"pregrasp_rot={float(grasp.get('pregrasp_rotation_score', 0.0)):.4f}, "
+            f"stress_rot={float(grasp.get('stress_rotation_score', 0.0)):.4f})",
             flush=True,
         )
         print(

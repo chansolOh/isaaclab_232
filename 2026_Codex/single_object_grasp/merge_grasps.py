@@ -225,6 +225,17 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
     rotation_scores = np.asarray(
         [item.get("rotation_score", np.nan) for item in items], dtype=np.float32
     )
+    force_scores = np.asarray(
+        [item.get("force_score", np.nan) for item in items], dtype=np.float32
+    )
+    pregrasp_rotation_scores = np.asarray(
+        [item.get("pregrasp_rotation_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
+    stress_rotation_scores = np.asarray(
+        [item.get("stress_rotation_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
     normals = np.asarray(
         [item.get("normal", [np.nan] * 3) for item in items], dtype=np.float32
     ).reshape(-1, 3)
@@ -238,6 +249,9 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
         rotation_matrix=matrices[:, :3, :3],
         score=scores,
         rotation_score=rotation_scores,
+        force_score=force_scores,
+        pregrasp_rotation_score=pregrasp_rotation_scores,
+        stress_rotation_score=stress_rotation_scores,
         normal=normals,
         scene_id=np.asarray([item["scene_id"] for item in items]),
         gripper_model=np.asarray([item["gripper_model"] for item in items]),

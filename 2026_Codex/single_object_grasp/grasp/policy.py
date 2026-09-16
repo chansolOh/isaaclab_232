@@ -18,6 +18,11 @@ STRESS = 2
 DONE = 3
 DISABLED = 4
 
+FORCE_SCORE_WEIGHT = 0.25
+PREGRASP_ROTATION_SCORE_WEIGHT = 0.50
+STRESS_ROTATION_SCORE_WEIGHT = 0.25
+ROTATION_SCORE_RANGE_RAD = math.pi
+
 
 def normalize_quaternion(quaternion: torch.Tensor) -> torch.Tensor:
     return quaternion / torch.linalg.vector_norm(
@@ -105,6 +110,7 @@ class GraspPolicy:
         device: str,
         env_origin: torch.Tensor,
         object_initial_pos: torch.Tensor,
+        object_initial_quat: torch.Tensor,
         approach_height: float = 0.12,
         approach_duration: float = 0.8,
         close_timeout: float = 1.5,
@@ -135,6 +141,7 @@ class GraspPolicy:
         self.device = device
         self.env_origin = env_origin
         self.object_initial_pos = object_initial_pos.clone()
+        self.object_initial_quat = normalize_quaternion(object_initial_quat.clone())
         self.approach_height = float(approach_height)
         self.approach_steps = max(1, round(approach_duration / self.step_dt))
         self.close_timeout_steps = max(1, round(close_timeout / self.step_dt))
@@ -218,6 +225,16 @@ class GraspPolicy:
         self.maximum_pre_stress_object_motion = torch.zeros(
             e, dtype=torch.float, **kwargs
         )
+        self.pregrasp_rotation_error = torch.zeros(
+            e, dtype=torch.float, **kwargs
+        )
+        self.stress_rotation_error = torch.zeros(
+            e, dtype=torch.float, **kwargs
+        )
+        self.stress_start_object_quat = torch.zeros(
+            (e, 4), dtype=torch.float, **kwargs
+        )
+        self.stress_start_object_quat[:, 0] = 1.0
 
     def _prepare_records(self) -> None:
         starts, ends, start_quat, end_quat = [], [], [], []
@@ -343,6 +360,10 @@ class GraspPolicy:
         self.minimum_contact_separation[active] = torch.inf
         self.minimum_close_contact_separation[active] = torch.inf
         self.maximum_pre_stress_object_motion[active] = 0.0
+        self.pregrasp_rotation_error[active] = 0.0
+        self.stress_rotation_error[active] = 0.0
+        self.stress_start_object_quat[active] = 0.0
+        self.stress_start_object_quat[active, 0] = 1.0
         self.applied_z_hop[active] = 0.0
         for env_id in active.tolist():
             self.failed_reason[env_id] = ""
@@ -469,6 +490,12 @@ class GraspPolicy:
         )
         self.reference_rel_pos[env_ids] = rel_pos
         self.reference_rel_quat[env_ids] = rel_quat
+        grasped_object_quat = normalize_quaternion(object_quat[env_ids])
+        self.stress_start_object_quat[env_ids] = grasped_object_quat
+        self.pregrasp_rotation_error[env_ids] = quaternion_angle(
+            grasped_object_quat, self.object_initial_quat[env_ids]
+        )
+        self.stress_rotation_error[env_ids] = 0.0
         # Pin the stress test to the pose PhysX actually reached. Root motion
         # is speed-limited, so this can differ slightly from the command pose.
         self.end_pos[env_ids] = robot_pos[env_ids] - self.env_origin[env_ids]
@@ -646,6 +673,9 @@ class GraspPolicy:
             rotation_error = quaternion_angle(rel_quat, self.reference_rel_quat[tested])
             self.relative_translation_error[tested] = position_error
             self.relative_rotation_error[tested] = rotation_error
+            self.stress_rotation_error[tested] = quaternion_angle(
+                object_quat[tested], self.stress_start_object_quat[tested]
+            )
             lost_contact = contact_force[tested] < self.min_contact_force
             self.contact_lost_count[tested] = torch.where(
                 lost_contact,
@@ -719,18 +749,42 @@ class GraspPolicy:
                 continue
             source_id = int(self.assigned_pregrasp[env_id])
             source = self.records[source_id]
-            rotation_score = max(
-                0.0,
-                1.0 - float(self.relative_rotation_error[env_id]) / math.pi,
+            pregrasp_rotation_score = min(
+                1.0,
+                max(
+                    0.0,
+                    1.0
+                    - float(self.pregrasp_rotation_error[env_id])
+                    / ROTATION_SCORE_RANGE_RAD,
+                ),
             )
-            retention_score = max(
-                0.0,
-                1.0
-                - float(self.relative_translation_error[env_id])
-                / self.max_relative_translation,
+            stress_rotation_score = min(
+                1.0,
+                max(
+                    0.0,
+                    1.0
+                    - float(self.stress_rotation_error[env_id])
+                    / ROTATION_SCORE_RANGE_RAD,
+                ),
             )
-            survival = float(self.stress_survival[env_id])
-            score = survival * (0.50 + 0.30 * rotation_score + 0.20 * retention_score)
+            survival = min(
+                1.0,
+                max(0.0, float(self.stress_survival[env_id])),
+            )
+            score = (
+                FORCE_SCORE_WEIGHT * survival
+                + PREGRASP_ROTATION_SCORE_WEIGHT * pregrasp_rotation_score
+                + STRESS_ROTATION_SCORE_WEIGHT * stress_rotation_score
+            )
+            # Compatibility field for visualization/legacy readers. This is
+            # the two rotation components normalized by their total 0.75 weight.
+            rotation_score = (
+                PREGRASP_ROTATION_SCORE_WEIGHT * pregrasp_rotation_score
+                + STRESS_ROTATION_SCORE_WEIGHT * stress_rotation_score
+            ) / (
+                PREGRASP_ROTATION_SCORE_WEIGHT
+                + STRESS_ROTATION_SCORE_WEIGHT
+            )
             quaternion = self.end_quat[env_id]
             matrix = torch.eye(4, dtype=torch.float, device=self.device)
             matrix[:3, :3] = quaternion_to_matrix(quaternion)
@@ -749,10 +803,21 @@ class GraspPolicy:
                 "gripper_type": self.gripper["type"],
                 "score": round(score, 6),
                 "rotation_score": round(rotation_score, 6),
+                "force_score": round(survival, 6),
+                "pregrasp_rotation_score": round(pregrasp_rotation_score, 6),
+                "stress_rotation_score": round(stress_rotation_score, 6),
                 "normal": self.force_direction[env_id].detach().cpu().numpy().round(7).tolist(),
                 "quality": {
                     "result": result,
                     "test_sequence": "close_then_stress",
+                    "score_weights": {
+                        "force": FORCE_SCORE_WEIGHT,
+                        "pregrasp_rotation": PREGRASP_ROTATION_SCORE_WEIGHT,
+                        "stress_rotation": STRESS_ROTATION_SCORE_WEIGHT,
+                    },
+                    "rotation_score_range_deg": math.degrees(
+                        ROTATION_SCORE_RANGE_RAD
+                    ),
                     "stress_survival": round(survival, 6),
                     "max_test_force_n": round(float(self.max_test_force[env_id]), 6),
                     "relative_translation_error_m": round(
@@ -760,6 +825,18 @@ class GraspPolicy:
                     ),
                     "relative_rotation_error_deg": round(
                         math.degrees(float(self.relative_rotation_error[env_id])), 5
+                    ),
+                    "pregrasp_rotation_error_deg": round(
+                        math.degrees(
+                            float(self.pregrasp_rotation_error[env_id])
+                        ),
+                        5,
+                    ),
+                    "stress_rotation_error_deg": round(
+                        math.degrees(
+                            float(self.stress_rotation_error[env_id])
+                        ),
+                        5,
                     ),
                     "contact_force_n": round(float(self.last_contact_force[env_id]), 6),
                     "minimum_contact_separation_m": self._minimum_separation_value(
@@ -797,11 +874,20 @@ class GraspPolicy:
                     "source_pregrasp_index": source_id,
                     "result": result,
                     "score": score,
+                    "force_score": survival,
+                    "pregrasp_rotation_score": pregrasp_rotation_score,
+                    "stress_rotation_score": stress_rotation_score,
                     "relative_translation_error_m": float(
                         self.relative_translation_error[env_id]
                     ),
                     "relative_rotation_error_deg": math.degrees(
                         float(self.relative_rotation_error[env_id])
+                    ),
+                    "pregrasp_rotation_error_deg": math.degrees(
+                        float(self.pregrasp_rotation_error[env_id])
+                    ),
+                    "stress_rotation_error_deg": math.degrees(
+                        float(self.stress_rotation_error[env_id])
                     ),
                     "contact_force_n": float(self.last_contact_force[env_id]),
                     "minimum_contact_separation_m": self._minimum_separation_value(

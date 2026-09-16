@@ -164,8 +164,22 @@ PhysX 전체 버퍼는 설치된 Isaac Lab의 표준 용량을 사용한다.
 최소 변화량이다.
 
 pre-grasp 위치에서 접근하고 닫은 뒤, 들어 올리는 단계 없이 현재 위치에서 바로
-임의 방향 증가 하중 시험을 수행한다. 각 grasp에는 `score`, `rotation_score`, stress 생존율,
-최대 시험 하중, 상대 위치/회전 오차와 contact force가 저장된다.
+임의 방향 증가 하중 시험을 수행한다. 최종 점수는 다음 세 성분의 가중합이며
+항상 0~1 범위다.
+
+- 외력을 버틴 비율 `force_score`: 25%
+- scene 초기 물체 자세와 외력 시험 직전 파지된 물체 자세의 회전 차이
+  `pregrasp_rotation_score`: 50%
+- 외력 시험 직전 물체 자세와 외력 시험 종료 시점 물체 자세의 회전 차이
+  `stress_rotation_score`: 25%
+
+두 회전 성분은 위치 이동을 사용하지 않고 quaternion의 최단 회전각만 사용하며,
+`clamp(1 - 두 자세의 회전각 차이 / 180도, 0, 1)`로 계산한다. 따라서 공식은
+`score = 0.25*force_score + 0.50*pregrasp_rotation_score +
+0.25*stress_rotation_score`다. 회전 변화가 없으면 회전 점수는 1이며,
+회전 변화가 클수록 0에 가까워진다. 각 grasp에는
+세 성분 점수, 두 시점 사이의 회전각, stress 생존율, 최대 시험 하중,
+상대 위치/회전 오차와 contact force가 저장된다.
 외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
 상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
 contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
