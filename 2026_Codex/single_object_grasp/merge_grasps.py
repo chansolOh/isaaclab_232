@@ -231,6 +231,10 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
     force_scores = np.asarray(
         [item.get("force_score", np.nan) for item in items], dtype=np.float32
     )
+    contact_area_scores = np.asarray(
+        [item.get("contact_area_score", np.nan) for item in items],
+        dtype=np.float32,
+    )
     pregrasp_rotation_scores = np.asarray(
         [item.get("pregrasp_rotation_score", np.nan) for item in items],
         dtype=np.float32,
@@ -270,6 +274,7 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
         rotation_score=rotation_scores,
         pose_score=pose_scores,
         force_score=force_scores,
+        contact_area_score=contact_area_scores,
         pregrasp_pose_score=pregrasp_pose_scores,
         stress_pose_score=stress_pose_scores,
         pregrasp_center_score=pregrasp_center_scores,

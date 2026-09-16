@@ -109,7 +109,7 @@ def rotation_score_color(score: float) -> tuple[float, float, float, float]:
     return rgb + (1.0,)
 
 
-def draw_saved_grasp(draw, grasp: dict) -> None:
+def draw_saved_grasp(draw, grasp: dict, score_field: str = "pose_score") -> None:
     """Draw the saved Open3D grasp geometry in the Isaac Sim viewport."""
     draw.clear_lines()
     draw.clear_points()
@@ -123,11 +123,11 @@ def draw_saved_grasp(draw, grasp: dict) -> None:
     box = [tuple(float(value) for value in point) for point in raw_box]
     red = (1.0, 0.12, 0.05, 1.0)
     score_color = rotation_score_color(
-        grasp.get("pose_score", grasp.get("rotation_score", 1.0))
+        grasp.get(score_field, grasp.get("score", 1.0))
     )
 
     # Same three edges as grasp_data_viz.py. The center edge color represents
-    # rotation_score; the two finger-side edges are red.
+    # the active sort score; the two finger-side edges are red.
     starts = [box[0], box[1], box[2]]
     ends = [box[1], box[2], box[3]]
     colors = [red, score_color, red]
@@ -201,7 +201,14 @@ if not isinstance(all_grasps, list) or not all_grasps:
     raise ValueError(f"No collected grasps in {grasp_path}")
 
 end_index = len(all_grasps) if END_GRASP_INDEX is None else int(END_GRASP_INDEX)
-selected_grasps = all_grasps[int(START_GRASP_INDEX) : end_index : max(1, int(STRIDE))]
+selected_output_indices = list(
+    range(
+        int(START_GRASP_INDEX),
+        min(end_index, len(all_grasps)),
+        max(1, int(STRIDE)),
+    )
+)
+selected_grasps = [all_grasps[index] for index in selected_output_indices]
 if not selected_grasps:
     raise ValueError("Selected grasp range is empty")
 
@@ -319,16 +326,71 @@ try:
         "pending": 0,
         "running": False,
         "quit": False,
+        "sort_field": "score",
+        "sort_label": "total score",
     }
 
     def request_index(index: int) -> None:
         state["pending"] = int(index) % len(selected_grasps)
 
+    sort_keys = {
+        "1": ("force_score", "force score"),
+        "2": ("pregrasp_pose_score", "pregrasp pose score"),
+        "3": ("stress_pose_score", "stress pose score"),
+        "4": ("contact_area_score", "contact area score"),
+    }
+
+    def replay_sort_value(grasp: dict, field: str) -> float:
+        if field == "contact_area_score":
+            # Older files used a 100 mm^2 saturation threshold, leaving many
+            # contact_area_score values tied at 1. Sort by the preserved raw
+            # footprint whenever it is available.
+            raw_area = grasp.get("quality", {}).get("grasp_contact_area_mm2")
+            if raw_area is not None:
+                return float(raw_area)
+        return float(grasp.get(field, float("-inf")))
+
+    def sort_replays(field: str, label: str) -> None:
+        order = sorted(
+            range(len(selected_grasps)),
+            key=lambda index: (
+                replay_sort_value(selected_grasps[index], field),
+                float(selected_grasps[index].get("score", 0.0)),
+            ),
+            reverse=True,
+        )
+        selected_grasps[:] = [selected_grasps[index] for index in order]
+        replay_pregrasps[:] = [replay_pregrasps[index] for index in order]
+        selected_output_indices[:] = [
+            selected_output_indices[index] for index in order
+        ]
+        state["sort_field"] = field
+        state["sort_label"] = label
+        print(
+            f"Replay sort > {label} descending; restarting at index 0",
+            flush=True,
+        )
+        request_index(0)
+
     def on_keyboard_event(event, *_) -> bool:
         if event.type != carb.input.KeyboardEventType.KEY_PRESS:
             return True
         key = getattr(event.input, "name", str(event.input).split(".")[-1]).upper()
-        if key in {"N", "RIGHT", "SPACE", "ENTER"}:
+        number_key = None
+        for number in sort_keys:
+            if key in {
+                number,
+                f"KEY_{number}",
+                f"KEY{number}",
+                f"NUMPAD_{number}",
+                f"NUMPAD{number}",
+                f"KP_{number}",
+            }:
+                number_key = number
+                break
+        if number_key is not None:
+            sort_replays(*sort_keys[number_key])
+        elif key in {"N", "RIGHT", "SPACE", "ENTER"}:
             request_index(state["index"] + 1)
         elif key in {"P", "LEFT", "BACKSPACE"}:
             request_index(state["index"] - 1)
@@ -365,21 +427,23 @@ try:
             direction = torch.tensor(normal, dtype=torch.float, device=env.device)
             direction /= torch.linalg.vector_norm(direction).clamp_min(1.0e-8)
             env.policy.force_direction[0] = direction
-        draw_saved_grasp(debug_draw, grasp)
+        draw_saved_grasp(debug_draw, grasp, state["sort_field"])
 
         state["index"] = index
         state["pending"] = None
         state["running"] = True
         quality = grasp.get("quality", {})
-        output_index = int(START_GRASP_INDEX) + index * max(1, int(STRIDE))
+        output_index = selected_output_indices[index]
         print("", flush=True)
         print(
             "Replay > "
             f"grasp={output_index + 1}/{len(all_grasps)} "
             f"selected={index + 1}/{len(selected_grasps)} "
+            f"sort={state['sort_label']} "
             f"source_pregrasp={grasp['source_pregrasp_index']} "
             f"score={float(grasp.get('score', 0.0)):.6f} "
             f"(force={float(grasp.get('force_score', 0.0)):.4f}, "
+            f"area={float(grasp.get('contact_area_score', 0.0)):.4f}, "
             f"pregrasp_pose={float(grasp.get('pregrasp_pose_score', 0.0)):.4f}, "
             f"stress_pose={float(grasp.get('stress_pose_score', 0.0)):.4f})",
             flush=True,
@@ -395,7 +459,8 @@ try:
 
     print(
         "Replay keyboard > N/Right/Space=next, P/Left=previous, "
-        "R=replay current, Q/Esc=quit",
+        "R=replay current, 1=force, 2=pregrasp pose, 3=stress pose, "
+        "4=contact area, Q/Esc=quit",
         flush=True,
     )
     print(
@@ -425,6 +490,7 @@ try:
                     f"result={actual.get('result')} "
                     f"penetration={actual.get('maximum_contact_penetration_mm')}mm "
                     f"translation_error={actual.get('relative_translation_error_m')}m; "
+                    f"contact_area={float(actual.get('grasp_contact_area_m2', 0.0)) * 1.0e6:.4f}mm^2; "
                     "final pose held",
                     flush=True,
                 )

@@ -18,13 +18,18 @@ STRESS = 2
 DONE = 3
 DISABLED = 4
 
-FORCE_SCORE_WEIGHT = 0.4
+FORCE_SCORE_WEIGHT = 0.3
 PREGRASP_POSE_SCORE_WEIGHT = 0.4
 STRESS_POSE_SCORE_WEIGHT = 0.2
 CENTER_IN_POSE_WEIGHT = 0.5
 ROTATION_IN_POSE_WEIGHT = 0.5
 CENTER_SCORE_RANGE_M = 0.010
 ROTATION_SCORE_RANGE_RAD = math.pi
+CONTACT_AREA_SCORE_WEIGHT = 0.30
+CONTACT_AREA_SCORE_RANGE_MM2 = 500.0
+# 1.0 keeps each component linear. Values > 1 emphasize already-high scores;
+# a logarithm is intentionally not used because log(total_score) cannot change rank.
+SCORE_COMPONENT_POWER = 1.5
 
 
 def normalize_quaternion(quaternion: torch.Tensor) -> torch.Tensor:
@@ -243,6 +248,7 @@ class GraspPolicy:
             (e, 4), dtype=torch.float, **kwargs
         )
         self.stress_start_object_quat[:, 0] = 1.0
+        self.grasp_contact_area = torch.zeros(e, dtype=torch.float, **kwargs)
 
     def _prepare_records(self) -> None:
         starts, ends, start_quat, end_quat = [], [], [], []
@@ -375,6 +381,7 @@ class GraspPolicy:
         self.stress_start_object_pos[active] = 0.0
         self.stress_start_object_quat[active] = 0.0
         self.stress_start_object_quat[active, 0] = 1.0
+        self.grasp_contact_area[active] = 0.0
         self.applied_z_hop[active] = 0.0
         for env_id in active.tolist():
             self.failed_reason[env_id] = ""
@@ -493,6 +500,7 @@ class GraspPolicy:
         object_quat: torch.Tensor,
         robot_pos: torch.Tensor,
         robot_quat: torch.Tensor,
+        contact_area: torch.Tensor,
     ) -> None:
         if not len(env_ids):
             return
@@ -513,6 +521,7 @@ class GraspPolicy:
         )
         self.stress_center_error[env_ids] = 0.0
         self.stress_rotation_error[env_ids] = 0.0
+        self.grasp_contact_area[env_ids] = contact_area[env_ids]
         # Pin the stress test to the pose PhysX actually reached. Root motion
         # is speed-limited, so this can differ slightly from the command pose.
         self.end_pos[env_ids] = robot_pos[env_ids] - self.env_origin[env_ids]
@@ -574,6 +583,7 @@ class GraspPolicy:
         joint_pos: torch.Tensor,
         contact_force: torch.Tensor,
         minimum_contact_separation: torch.Tensor,
+        contact_area: torch.Tensor,
         applied_force: torch.Tensor,
     ) -> torch.Tensor:
         """Advance contact-dependent stages and return episode-done mask."""
@@ -673,7 +683,12 @@ class GraspPolicy:
                 # alone must never start the external-force test.
                 empty = timed_out & (~blocked | ~contact_confirmed)
             self._start_stress(
-                closing[grasped], object_pos, object_quat, robot_pos, robot_quat
+                closing[grasped],
+                object_pos,
+                object_quat,
+                robot_pos,
+                robot_quat,
+                contact_area,
             )
             self._finish_without_record(closing[empty], "empty_close")
 
@@ -817,11 +832,31 @@ class GraspPolicy:
                 CENTER_IN_POSE_WEIGHT * stress_center_score
                 + ROTATION_IN_POSE_WEIGHT * stress_rotation_score
             )
-            score = (
-                FORCE_SCORE_WEIGHT * survival
-                + PREGRASP_POSE_SCORE_WEIGHT * pregrasp_pose_score
-                + STRESS_POSE_SCORE_WEIGHT * stress_pose_score
+            contact_area_score = min(
+                1.0,
+                max(
+                    0.0,
+                    float(self.grasp_contact_area[env_id]) * 1.0e6
+                    / CONTACT_AREA_SCORE_RANGE_MM2,
+                ),
             )
+            score_weight_sum = (
+                FORCE_SCORE_WEIGHT
+                + PREGRASP_POSE_SCORE_WEIGHT
+                + STRESS_POSE_SCORE_WEIGHT
+                + CONTACT_AREA_SCORE_WEIGHT
+            )
+            if score_weight_sum <= 0.0:
+                raise ValueError("At least one score weight must be positive")
+            score = (
+                FORCE_SCORE_WEIGHT * survival**SCORE_COMPONENT_POWER
+                + PREGRASP_POSE_SCORE_WEIGHT
+                * pregrasp_pose_score**SCORE_COMPONENT_POWER
+                + STRESS_POSE_SCORE_WEIGHT
+                * stress_pose_score**SCORE_COMPONENT_POWER
+                + CONTACT_AREA_SCORE_WEIGHT
+                * contact_area_score**SCORE_COMPONENT_POWER
+            ) / score_weight_sum
             # Compatibility field for readers that still visualize rotation only.
             rotation_score = (
                 PREGRASP_POSE_SCORE_WEIGHT * pregrasp_rotation_score
@@ -854,6 +889,7 @@ class GraspPolicy:
                 "rotation_score": round(rotation_score, 6),
                 "pose_score": round(pose_score, 6),
                 "force_score": round(survival, 6),
+                "contact_area_score": round(contact_area_score, 6),
                 "pregrasp_pose_score": round(pregrasp_pose_score, 6),
                 "stress_pose_score": round(stress_pose_score, 6),
                 "pregrasp_center_score": round(pregrasp_center_score, 6),
@@ -868,11 +904,21 @@ class GraspPolicy:
                         "force": FORCE_SCORE_WEIGHT,
                         "pregrasp_pose": PREGRASP_POSE_SCORE_WEIGHT,
                         "stress_pose": STRESS_POSE_SCORE_WEIGHT,
+                        "contact_area": CONTACT_AREA_SCORE_WEIGHT,
                     },
+                    "score_component_power": SCORE_COMPONENT_POWER,
                     "pose_component_weights": {
                         "center": CENTER_IN_POSE_WEIGHT,
                         "rotation": ROTATION_IN_POSE_WEIGHT,
                     },
+                    "contact_area_score_range_mm2": CONTACT_AREA_SCORE_RANGE_MM2,
+                    "contact_area_estimator": "physx_manifold_footprint",
+                    "grasp_contact_area_m2": round(
+                        float(self.grasp_contact_area[env_id]), 9
+                    ),
+                    "grasp_contact_area_mm2": round(
+                        float(self.grasp_contact_area[env_id]) * 1.0e6, 4
+                    ),
                     "center_score_range_m": CENTER_SCORE_RANGE_M,
                     "rotation_score_range_deg": math.degrees(
                         ROTATION_SCORE_RANGE_RAD
@@ -940,6 +986,10 @@ class GraspPolicy:
                     "result": result,
                     "score": score,
                     "force_score": survival,
+                    "contact_area_score": contact_area_score,
+                    "grasp_contact_area_m2": float(
+                        self.grasp_contact_area[env_id]
+                    ),
                     "pregrasp_pose_score": pregrasp_pose_score,
                     "stress_pose_score": stress_pose_score,
                     "pregrasp_center_score": pregrasp_center_score,

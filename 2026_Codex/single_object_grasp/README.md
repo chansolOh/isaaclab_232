@@ -164,23 +164,31 @@ PhysX 전체 버퍼는 설치된 Isaac Lab의 표준 용량을 사용한다.
 최소 변화량이다.
 
 pre-grasp 위치에서 접근하고 닫은 뒤, 들어 올리는 단계 없이 현재 위치에서 바로
-임의 방향 증가 하중 시험을 수행한다. 최종 점수는 다음 세 성분의 가중합이며
+임의 방향 증가 하중 시험을 수행한다. 최종 점수는 다음 성분의 가중합이며
 항상 0~1 범위다.
 
-- 외력을 버틴 비율 `force_score`: 40%
-- scene 초기 물체 자세와 외력 시험 직전 파지된 물체 자세의 차이
-  `pregrasp_pose_score`: 40%
-- 외력 시험 직전 물체 자세와 외력 시험 종료 시점 물체 자세의 차이
-  `stress_pose_score`: 20%
+- 외력 생존 `force_score`
+- 파지 전후 자세 `pregrasp_pose_score`
+- 외력 전후 자세 `stress_pose_score`
+- 파지 완료 시점의 추정 접촉 패치 면적 `contact_area_score`
 
 각 자세 점수는 center 점수 50%와 회전 점수 50%의 평균이다. center 점수는
 `clamp(1 - center 이동거리 / 10 mm, 0, 1)`, 회전 점수는 quaternion의
 최단 회전각을 사용한 `clamp(1 - 회전각 차이 / 180도, 0, 1)`이다.
 따라서 center와 회전 변화가 모두 없으면 자세 점수는 1이며, 변화가 클수록
-0에 가까워진다. 최종 공식은 `score = 0.40*force_score +
-0.40*pregrasp_pose_score + 0.20*stress_pose_score`다. 각 grasp에는
+0에 가까워진다. 접촉 면적 점수는 링크별 PhysX contact manifold 점들을
+contact normal 방향별 평면 패치로 분리한 뒤 등가 직사각형으로 근사해 합산하고,
+500 mm²에서 1점으로 포화한다. 이 값은 PhysX rigid contact의 이산 manifold
+점들로 계산한 접촉 footprint이며, 변형 가능한 물체의 실제 물리 접촉면적은 아니다.
+반대쪽 손가락들의 점은 서로 다른 패치로 계산하므로 물체 폭이 면적에 포함되지
+않는다. 네 항목은 `policy.py` 상단의 각 `*_SCORE_WEIGHT`를 곱해 합산한 뒤
+가중치 합으로 나누므로, 가중치 합을 직접 1로 맞추지 않아도 최종 점수는
+0~1 범위다. `SCORE_COMPONENT_POWER=1.0`은 선형 점수이고, 1보다 크게 하면
+높은 component score를 더 강조한다. 최종 점수에 로그를 취하는 것은 정렬을
+바꾸지 않으므로 사용하지 않는다. 각 grasp에는
 자세 및 하위 center/회전 점수, 두 시점 사이의 center 거리와 회전각,
-stress 생존율, 최대 시험 하중, 상대 위치/회전 오차와 contact force가 저장된다.
+추정 접촉 면적(m²/mm²), stress 생존율, 최대 시험 하중, 상대 위치/회전 오차와
+contact force가 저장된다.
 외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
 상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
 contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
@@ -219,7 +227,14 @@ Isaac Sim debug draw로 저장된 `grasp_box`를 빨간/점수 색 선으로,
 - `N` / `Right` / `Space`: 다음 grasp
 - `P` / `Left`: 이전 grasp
 - `R`: 현재 grasp 다시 재생
+- `1` / 숫자패드 `1`: 외력 점수 내림차순 정렬 후 0번부터 재생
+- `2` / 숫자패드 `2`: 파지 전후 자세 점수 내림차순 정렬 후 0번부터 재생
+- `3` / 숫자패드 `3`: 외력 전후 자세 점수 내림차순 정렬 후 0번부터 재생
+- `4` / 숫자패드 `4`: 접촉 면적 점수 내림차순 정렬 후 0번부터 재생
 - `Q` / `Esc`: 종료
+
+기존 파일은 100 mm²에서 면적 점수가 포화되어 동률이 많으므로, 4번 정렬은
+`quality.grasp_contact_area_mm2` 원값이 있으면 그 값을 우선 사용한다.
 
 ## 4. grasp 병합
 

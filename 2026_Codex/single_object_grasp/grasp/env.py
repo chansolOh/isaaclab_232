@@ -18,7 +18,7 @@ from isaaclab.utils import configclass
 
 from . import calibration
 from . import scene_cfg as SC
-from .policy import APPROACH, STRESS, GraspPolicy, quaternion_multiply, quaternion_slerp
+from .policy import APPROACH, CLOSE, STRESS, GraspPolicy, quaternion_multiply, quaternion_slerp
 
 
 class EnvGroupedContactSensor(ContactSensor):
@@ -239,6 +239,8 @@ def configure_gripper(cfg, gripper: dict, pre_grasps: list[dict]) -> None:
     cfg.contact_sensor_names = []
     cfg.penetration_contact_sensor_names = []
     cfg.penetration_contact_sensor_paths = []
+    cfg.contact_area_sensor_names = []
+    cfg.contact_area_filter_indices = []
     paths = _contact_paths(gripper)
     # Resolve the actual RigidBodyAPI prim. Some assets use /World as their
     # default prim and place the object one level below it.
@@ -247,6 +249,15 @@ def configure_gripper(cfg, gripper: dict, pre_grasps: list[dict]) -> None:
     if object_body_path:
         object_filter = f"{object_filter}/{object_body_path}"
     all_gripper_body_paths = _matching_rigid_body_paths(gripper["usd_path"], ".*")
+    contact_area_body_paths = sorted(
+        {
+            body_path
+            for expression in paths
+            for body_path in _matching_rigid_body_paths(
+                gripper["usd_path"], expression
+            )
+        }
+    )
     if not is_hand:
         cfg.scene.contact_sensor.prim_path = f"{cfg.robot_prim_path}/{paths[0]}"
         cfg.scene.contact_sensor.class_type = EnvGroupedContactSensor
@@ -276,6 +287,8 @@ def configure_gripper(cfg, gripper: dict, pre_grasps: list[dict]) -> None:
                 )
                 cfg.penetration_contact_sensor_names.append(name)
                 cfg.penetration_contact_sensor_paths.append(path)
+                if path in contact_area_body_paths:
+                    cfg.contact_area_sensor_names.append(name)
     else:
         # One unfiltered aggregate sensor reads force from every configured
         # fingertip. Detailed fingertip sensors below are fallback-only.
@@ -306,6 +319,7 @@ def configure_gripper(cfg, gripper: dict, pre_grasps: list[dict]) -> None:
                 )
                 cfg.penetration_contact_sensor_names.append(name)
                 cfg.penetration_contact_sensor_paths.append(path)
+                cfg.contact_area_sensor_names.append(name)
 
     if cfg.enable_object_contact_sensor:
         # One object-side detailed view observes every articulation rigid body.
@@ -335,6 +349,11 @@ def configure_gripper(cfg, gripper: dict, pre_grasps: list[dict]) -> None:
         cfg.penetration_contact_sensor_paths.append(
             f"object:{object_body_path or '<root>'}->robot({len(robot_filters)} bodies)"
         )
+        cfg.contact_area_filter_indices = [
+            index
+            for index, body_path in enumerate(all_gripper_body_paths)
+            if body_path in contact_area_body_paths
+        ]
 
     cfg.scene.obj00.spawn.rigid_props = sim_utils.RigidBodyPropertiesCfg(
         disable_gravity=True,
@@ -590,12 +609,15 @@ class RobotEnv(DirectRLEnv):
             )
         return mapping
 
-    def _minimum_contact_separation(
-        self, *, emit_debug: bool = False
-    ) -> torch.Tensor:
-        """Return deepest gripper-object contact separation per logical env."""
+    def _contact_metrics(
+        self, *, emit_debug: bool = False, include_area: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return minimum separation and estimated contact-patch area per env."""
         minimum = torch.full(
             (self.num_envs,), torch.inf, dtype=torch.float, device=self.device
+        )
+        contact_area = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
         )
         for sensor_index, (sensor, physical_row_to_env) in enumerate(zip(
             self.penetration_contact_sensors, self.contact_physical_row_to_env
@@ -605,7 +627,7 @@ class RobotEnv(DirectRLEnv):
             filter_count = int(view.filter_count)
             if filter_count < 1:
                 continue
-            _, _, _, separations, counts, starts = view.get_contact_data(
+            _, points, normals, separations, counts, starts = view.get_contact_data(
                 dt=self.physics_dt
             )
             counts = counts.reshape(-1).to(device=self.device, dtype=torch.long)
@@ -632,6 +654,99 @@ class RobotEnv(DirectRLEnv):
                 0, env_ids, valid_separations, reduce="amin", include_self=True
             )
             minimum = torch.minimum(minimum, sensor_minimum)
+            if include_area:
+                # PhysX reports points, not an exact triangle patch. One body
+                # pair may contain contacts on several object faces; grouping
+                # all of them would incorrectly count the gaps between faces.
+                # Split each pair by quantized contact normal first, estimate
+                # each coplanar patch, then sum independent patches per env.
+                valid_points = points.reshape(-1, 3).index_select(
+                    0, contact_indices
+                )
+                valid_normals = normals.reshape(-1, 3).index_select(
+                    0, contact_indices
+                )
+                pair_count = counts.numel()
+                normal_bins_per_axis = 9
+                normal_code_count = normal_bins_per_axis**3
+                unit_normals = valid_normals / torch.linalg.vector_norm(
+                    valid_normals, dim=1, keepdim=True
+                ).clamp_min(1.0e-8)
+                quantized_normals = torch.round(unit_normals * 4.0).to(torch.long)
+                normal_codes = (
+                    (quantized_normals[:, 0] + 4)
+                    * normal_bins_per_axis**2
+                    + (quantized_normals[:, 1] + 4) * normal_bins_per_axis
+                    + quantized_normals[:, 2]
+                    + 4
+                )
+                group_keys = pair_ids * normal_code_count + normal_codes
+                unique_group_keys, point_group_ids = torch.unique(
+                    group_keys, sorted=True, return_inverse=True
+                )
+                group_count = unique_group_keys.numel()
+                group_counts = torch.bincount(
+                    point_group_ids, minlength=group_count
+                )
+                point_sums = torch.zeros(
+                    (group_count, 3),
+                    dtype=valid_points.dtype,
+                    device=self.device,
+                )
+                point_sums.index_add_(0, point_group_ids, valid_points)
+                centers = point_sums / group_counts.clamp_min(1)[:, None]
+                centered = valid_points - centers[point_group_ids]
+                outer = centered[:, :, None] * centered[:, None, :]
+                covariance_sums = torch.zeros(
+                    (group_count, 3, 3),
+                    dtype=valid_points.dtype,
+                    device=self.device,
+                )
+                covariance_sums.index_add_(0, point_group_ids, outer)
+                group_pair_ids = unique_group_keys // normal_code_count
+                area_groups = torch.where(group_counts >= 3)[0]
+                sensor_name = self.cfg.penetration_contact_sensor_names[
+                    sensor_index
+                ]
+                if sensor_name == "object_penetration_contact_sensor":
+                    scoring_filters = torch.tensor(
+                        self.cfg.contact_area_filter_indices,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    pair_filter_ids = (
+                        torch.arange(pair_count, device=self.device) % filter_count
+                    )
+                    area_groups = area_groups[
+                        torch.isin(
+                            pair_filter_ids[group_pair_ids[area_groups]],
+                            scoring_filters,
+                        )
+                    ]
+                elif sensor_name not in self.cfg.contact_area_sensor_names:
+                    area_groups = area_groups[:0]
+                if len(area_groups):
+                    covariance = covariance_sums[area_groups] / group_counts[
+                        area_groups, None, None
+                    ]
+                    eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
+                    # PhysX manifold points normally lie on the patch boundary.
+                    # Four rectangle corners have variances side^2 / 4, so this
+                    # recovers their rectangle area while remaining rotation
+                    # invariant. With irregular manifolds it is an estimate.
+                    pair_areas = 4.0 * torch.sqrt(
+                        eigenvalues[:, 1] * eigenvalues[:, 2]
+                    )
+                    all_sensor_ids = (
+                        torch.arange(pair_count, device=self.device) // filter_count
+                    )
+                    all_physical_row_ids = all_sensor_ids // int(sensor.num_bodies)
+                    pair_env_ids = physical_row_to_env[all_physical_row_ids]
+                    contact_area.scatter_add_(
+                        0,
+                        pair_env_ids[group_pair_ids[area_groups]],
+                        pair_areas,
+                    )
             if self.cfg.print_contact_separation and emit_debug:
                 # Reset/unassigned envs can overlap at their default poses.
                 # They are irrelevant to grasp validation and would otherwise
@@ -659,17 +774,30 @@ class RobotEnv(DirectRLEnv):
                 self._printed_sensor_separation[sensor_index, update] = (
                     sensor_minimum[update]
                 )
-        return minimum
+        return minimum, contact_area
+
+    def _minimum_contact_separation(
+        self, *, emit_debug: bool = False
+    ) -> torch.Tensor:
+        return self._contact_metrics(emit_debug=emit_debug)[0]
+
+    def _penetration_contact_metrics(
+        self, *, emit_debug: bool = False, include_area: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Backend boundary for detailed gripper-object contact metrics."""
+        if self.cfg.penetration_backend == "contact_sensor":
+            return self._contact_metrics(
+                emit_debug=emit_debug, include_area=include_area
+            )
+        raise RuntimeError(
+            f"Unsupported penetration backend: {self.cfg.penetration_backend!r}"
+        )
 
     def _minimum_penetration_separation(
         self, *, emit_debug: bool = False
     ) -> torch.Tensor:
         """Backend boundary; a Warp query can replace this without policy changes."""
-        if self.cfg.penetration_backend == "contact_sensor":
-            return self._minimum_contact_separation(emit_debug=emit_debug)
-        raise RuntimeError(
-            f"Unsupported penetration backend: {self.cfg.penetration_backend!r}"
-        )
+        return self._penetration_contact_metrics(emit_debug=emit_debug)[0]
 
     def _limited_root_motion(
         self, desired_pose: torch.Tensor, env_ids: torch.Tensor
@@ -796,7 +924,15 @@ class RobotEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         object_pose = self.obj00.data.root_link_pose_w
         robot_pose = self.robot.data.root_link_pose_w
-        current_separation = self._minimum_penetration_separation(emit_debug=True)
+        measure_contact_area = bool(
+            torch.any(
+                (self.policy.action_enable == 1)
+                & (self.policy.stage_num == CLOSE)
+            ).item()
+        )
+        current_separation, contact_area = self._penetration_contact_metrics(
+            emit_debug=True, include_area=measure_contact_area
+        )
         minimum_separation = torch.minimum(
             self._substep_minimum_contact_separation, current_separation
         )
@@ -808,6 +944,7 @@ class RobotEnv(DirectRLEnv):
             joint_pos=self.robot.data.joint_pos,
             contact_force=self._contact_force(),
             minimum_contact_separation=minimum_separation,
+            contact_area=contact_area,
             applied_force=self.applied_force_n,
         )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
