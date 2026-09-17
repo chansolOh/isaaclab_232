@@ -131,6 +131,7 @@ class GraspPolicy:
         contact_penetration_threshold: float = 0.005,
         pre_stress_object_motion_threshold: float = 0.005,
         apply_finger_z_hop: bool = False,
+        grasp_record_mode: str = "attempt",
     ):
         if not pre_grasp_data:
             raise ValueError("pre_grasp_data is empty")
@@ -172,6 +173,13 @@ class GraspPolicy:
                 "pre_stress_object_motion_threshold must be non-negative"
             )
         self.apply_finger_z_hop = bool(apply_finger_z_hop)
+        self.grasp_record_mode = str(grasp_record_mode).strip().lower()
+        valid_record_modes = {"attempt", "grasp_complete_restored"}
+        if self.grasp_record_mode not in valid_record_modes:
+            raise ValueError(
+                f"grasp_record_mode must be one of {sorted(valid_record_modes)}, "
+                f"got {grasp_record_mode!r}"
+            )
         self.output_list: list[dict] = []
         self.attempt_history: list[dict] = []
         self.total_grasp_num = len(pre_grasp_data)
@@ -249,6 +257,8 @@ class GraspPolicy:
         )
         self.stress_start_object_quat[:, 0] = 1.0
         self.grasp_contact_area = torch.zeros(e, dtype=torch.float, **kwargs)
+        self.grasp_complete_joint = torch.zeros((e, j), dtype=torch.float, **kwargs)
+        self.grasp_complete_width = torch.zeros(e, dtype=torch.float, **kwargs)
 
     def _prepare_records(self) -> None:
         starts, ends, start_quat, end_quat = [], [], [], []
@@ -329,6 +339,21 @@ class GraspPolicy:
             value = math.radians(value)
         return torch.full((count, len(self.joint_names)), value, device=self.device)
 
+    def _finger_width(self, joint: torch.Tensor) -> torch.Tensor:
+        """Convert the actual driven joint position at grasp completion to width."""
+        driven = joint[:, 0]
+        if self.direct_prismatic:
+            closed = float(self.gripper["close_joint_deg"])
+            opened = float(self.gripper["open_joint_deg"])
+            direction = 1.0 if opened >= closed else -1.0
+            width = (driven - closed) * (2.0 / direction)
+        else:
+            degrees = driven * (180.0 / math.pi)
+            width = calibration.polynomial(
+                self.gripper["joint_to_width_coeffs"], degrees
+            )
+        return width.clamp(0.0, self.max_width)
+
     def _finger_joint_z(self, joint: torch.Tensor) -> torch.Tensor:
         if self.direct_prismatic:
             return torch.zeros(len(joint), dtype=torch.float, device=self.device)
@@ -382,6 +407,8 @@ class GraspPolicy:
         self.stress_start_object_quat[active] = 0.0
         self.stress_start_object_quat[active, 0] = 1.0
         self.grasp_contact_area[active] = 0.0
+        self.grasp_complete_joint[active] = 0.0
+        self.grasp_complete_width[active] = 0.0
         self.applied_z_hop[active] = 0.0
         for env_id in active.tolist():
             self.failed_reason[env_id] = ""
@@ -522,6 +549,10 @@ class GraspPolicy:
         self.stress_center_error[env_ids] = 0.0
         self.stress_rotation_error[env_ids] = 0.0
         self.grasp_contact_area[env_ids] = contact_area[env_ids]
+        completed_joint = self.joint_pos[env_ids][:, self.joint_index]
+        self.grasp_complete_joint[env_ids] = completed_joint
+        if not self.is_hand:
+            self.grasp_complete_width[env_ids] = self._finger_width(completed_joint)
         # Pin the stress test to the pose PhysX actually reached. Root motion
         # is speed-limited, so this can differ slightly from the command pose.
         self.end_pos[env_ids] = robot_pos[env_ids] - self.env_origin[env_ids]
@@ -742,9 +773,18 @@ class GraspPolicy:
 
         return (self.action_enable == 1) & (self.stage_num == DONE)
 
-    def _grasp_boxes(self, source: dict) -> np.ndarray:
+    def _grasp_boxes(
+        self,
+        source: dict,
+        *,
+        width: float | None = None,
+        center: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Return every world-frame contact bbox for this gripper grasp."""
-        center = np.asarray(source["target_points"], dtype=np.float64)
+        if center is None:
+            center = np.asarray(source["target_points"], dtype=np.float64)
+        else:
+            center = np.asarray(center, dtype=np.float64)
         yaw = math.radians(float(source["target_orientation"][2]))
         if self.is_hand:
             boxes = np.asarray(source.get("grasp_bbox", []), dtype=np.float64)
@@ -756,7 +796,9 @@ class GraspPolicy:
             return boxes
 
         half_height = float(self.gripper["height"]) * 0.5
-        attempted_width = float(source["target_width"])
+        attempted_width = (
+            float(source["target_width"]) if width is None else float(width)
+        )
         if self.gripper_type.startswith("finger2"):
             boxes = np.asarray(
                 [[
@@ -814,12 +856,19 @@ class GraspPolicy:
         return boxes
 
     def _enclosing_grasp_box(
-        self, source: dict, boxes: np.ndarray
+        self,
+        source: dict,
+        boxes: np.ndarray,
+        *,
+        center: np.ndarray | None = None,
     ) -> np.ndarray:
         """One compatibility rectangle enclosing all multi-finger bboxes."""
         if len(boxes) == 1:
             return boxes[0]
-        center = np.asarray(source["target_points"], dtype=np.float64)
+        if center is None:
+            center = np.asarray(source["target_points"], dtype=np.float64)
+        else:
+            center = np.asarray(center, dtype=np.float64)
         yaw = math.radians(float(source["target_orientation"][2]))
         x_axis = np.asarray([math.cos(yaw), math.sin(yaw), 0.0])
         y_axis = np.asarray([-math.sin(yaw), math.cos(yaw), 0.0])
@@ -837,6 +886,194 @@ class GraspPolicy:
             ],
             dtype=np.float64,
         )
+
+    @staticmethod
+    def _transform_points_np(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float64)
+        homogeneous = np.concatenate(
+            (points.reshape(-1, 3), np.ones((points.size // 3, 1))), axis=1
+        )
+        return (homogeneous @ matrix.T)[:, :3].reshape(points.shape)
+
+    @staticmethod
+    def _pose_matrix_np(position: torch.Tensor, quaternion: torch.Tensor) -> np.ndarray:
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, :3] = (
+            quaternion_to_matrix(quaternion).detach().cpu().numpy().astype(np.float64)
+        )
+        matrix[:3, 3] = position.detach().cpu().numpy().astype(np.float64)
+        return matrix
+
+    @staticmethod
+    def _matrix_to_quaternion_np(rotation: np.ndarray) -> np.ndarray:
+        """Convert a 3x3 rotation matrix to a canonical WXYZ quaternion."""
+        rotation = np.asarray(rotation, dtype=np.float64)
+        trace = float(np.trace(rotation))
+        if trace > 0.0:
+            scale = math.sqrt(trace + 1.0) * 2.0
+            quaternion = np.asarray(
+                [
+                    0.25 * scale,
+                    (rotation[2, 1] - rotation[1, 2]) / scale,
+                    (rotation[0, 2] - rotation[2, 0]) / scale,
+                    (rotation[1, 0] - rotation[0, 1]) / scale,
+                ]
+            )
+        else:
+            axis = int(np.argmax(np.diag(rotation)))
+            if axis == 0:
+                scale = math.sqrt(
+                    1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]
+                ) * 2.0
+                quaternion = np.asarray(
+                    [
+                        (rotation[2, 1] - rotation[1, 2]) / scale,
+                        0.25 * scale,
+                        (rotation[0, 1] + rotation[1, 0]) / scale,
+                        (rotation[0, 2] + rotation[2, 0]) / scale,
+                    ]
+                )
+            elif axis == 1:
+                scale = math.sqrt(
+                    1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]
+                ) * 2.0
+                quaternion = np.asarray(
+                    [
+                        (rotation[0, 2] - rotation[2, 0]) / scale,
+                        (rotation[0, 1] + rotation[1, 0]) / scale,
+                        0.25 * scale,
+                        (rotation[1, 2] + rotation[2, 1]) / scale,
+                    ]
+                )
+            else:
+                scale = math.sqrt(
+                    1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]
+                ) * 2.0
+                quaternion = np.asarray(
+                    [
+                        (rotation[1, 0] - rotation[0, 1]) / scale,
+                        (rotation[0, 2] + rotation[2, 0]) / scale,
+                        (rotation[1, 2] + rotation[2, 1]) / scale,
+                        0.25 * scale,
+                    ]
+                )
+        quaternion /= max(float(np.linalg.norm(quaternion)), 1.0e-12)
+        return quaternion if quaternion[0] >= 0.0 else -quaternion
+
+    @staticmethod
+    def _matrix_to_euler_xyz_deg_np(rotation: np.ndarray) -> np.ndarray:
+        """Return XYZ Euler angles for R = Rz(yaw) Ry(pitch) Rx(roll)."""
+        rotation = np.asarray(rotation, dtype=np.float64)
+        horizontal = math.hypot(float(rotation[0, 0]), float(rotation[1, 0]))
+        if horizontal > 1.0e-9:
+            roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
+            pitch = math.atan2(-float(rotation[2, 0]), horizontal)
+            yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+        else:
+            roll = math.atan2(-float(rotation[1, 2]), float(rotation[1, 1]))
+            pitch = math.atan2(-float(rotation[2, 0]), horizontal)
+            yaw = 0.0
+        return np.degrees(np.asarray([roll, pitch, yaw], dtype=np.float64))
+
+    def _orientation_fields(self, matrix: np.ndarray) -> dict:
+        rotation = np.asarray(matrix[:3, :3], dtype=np.float64)
+        grasp_rpy = self._matrix_to_euler_xyz_deg_np(rotation)
+        if self.is_hand:
+            target_rotation = rotation
+        else:
+            # Finger pregrasp target_orientation excludes the fixed 180-degree
+            # base flip added before commanding the articulation.
+            target_rotation = rotation @ np.diag([1.0, -1.0, -1.0])
+        return {
+            "target_orientation": self._matrix_to_euler_xyz_deg_np(target_rotation),
+            "grasp_orientation_wxyz": self._matrix_to_quaternion_np(rotation),
+            "grasp_orientation_rpy_deg": grasp_rpy,
+            "gripper_yaw_deg": float(grasp_rpy[2]),
+        }
+
+    def _record_geometry(self, env_id: int, source: dict) -> dict:
+        """Build either attempted or grasp-complete/object-restored geometry."""
+        force_direction = (
+            self.force_direction[env_id].detach().cpu().numpy().astype(np.float64)
+        )
+        if self.grasp_record_mode == "attempt":
+            boxes = self._grasp_boxes(source)
+            box = self._enclosing_grasp_box(source, boxes)
+            matrix = self._pose_matrix_np(
+                torch.tensor(source["target_points"], device=self.device),
+                self.end_quat[env_id],
+            )
+            geometry = {
+                "grasp_boxes": boxes,
+                "grasp_box": box,
+                "grasp_mat": matrix,
+                "target_points": np.asarray(source["target_points"], dtype=np.float64),
+                "target_width": float(source.get("target_width", 0.0)),
+                "force_direction": force_direction,
+                "restore_transform": np.eye(4, dtype=np.float64),
+            }
+            geometry.update(self._orientation_fields(matrix))
+            # Preserve exact legacy Euler values in attempt mode.
+            geometry["target_orientation"] = np.asarray(
+                source["target_orientation"], dtype=np.float64
+            )
+            return geometry
+
+        robot_matrix = self._pose_matrix_np(
+            self.end_pos[env_id], self.end_quat[env_id]
+        )
+        if self.is_hand:
+            boxes_at_completion = self._grasp_boxes(source)
+            grasp_center = boxes_at_completion.reshape(-1, 3).mean(axis=0)
+            recorded_width = float(source.get("target_width", 0.0))
+        else:
+            # Restored geometry keeps the width of the original pregrasp attempt.
+            # Actual completion width is retained in quality diagnostics only.
+            recorded_width = float(source.get("target_width", 0.0))
+            joint = self.grasp_complete_joint[env_id : env_id + 1]
+            finger_z = float(self._finger_joint_z(joint)[0])
+            grasp_center = (
+                robot_matrix[:3, 3]
+                + robot_matrix[:3, 2] * (self.total_length + finger_z)
+            )
+            boxes_at_completion = self._grasp_boxes(
+                source, width=recorded_width, center=grasp_center
+            )
+        box_at_completion = self._enclosing_grasp_box(
+            source, boxes_at_completion, center=grasp_center
+        )
+        grasp_matrix_at_completion = robot_matrix.copy()
+        grasp_matrix_at_completion[:3, 3] = grasp_center
+
+        initial_object_pos = self.object_initial_pos[env_id] - self.env_origin[env_id]
+        complete_object_pos = (
+            self.stress_start_object_pos[env_id] - self.env_origin[env_id]
+        )
+        initial_object_matrix = self._pose_matrix_np(
+            initial_object_pos, self.object_initial_quat[env_id]
+        )
+        complete_object_matrix = self._pose_matrix_np(
+            complete_object_pos, self.stress_start_object_quat[env_id]
+        )
+        restore = initial_object_matrix @ np.linalg.inv(complete_object_matrix)
+        restored_matrix = restore @ grasp_matrix_at_completion
+        restored_boxes = self._transform_points_np(restore, boxes_at_completion)
+        restored_box = self._transform_points_np(restore, box_at_completion)
+        restored_force = restore[:3, :3] @ force_direction
+        restored_force /= max(float(np.linalg.norm(restored_force)), 1.0e-12)
+        geometry = {
+            "grasp_boxes": restored_boxes,
+            "grasp_box": restored_box,
+            "grasp_mat": restored_matrix,
+            "target_points": restored_matrix[:3, 3],
+            "target_width": recorded_width,
+            "force_direction": restored_force,
+            "restore_transform": restore,
+            "initial_object_matrix": initial_object_matrix,
+            "complete_object_matrix": complete_object_matrix,
+        }
+        geometry.update(self._orientation_fields(restored_matrix))
+        return geometry
 
     def _minimum_separation_value(self, env_id: int) -> float | None:
         value = float(self.minimum_contact_separation[env_id])
@@ -943,21 +1180,34 @@ class GraspPolicy:
                 PREGRASP_POSE_SCORE_WEIGHT * pregrasp_pose_score
                 + STRESS_POSE_SCORE_WEIGHT * stress_pose_score
             ) / (PREGRASP_POSE_SCORE_WEIGHT + STRESS_POSE_SCORE_WEIGHT)
-            quaternion = self.end_quat[env_id]
-            grasp_boxes = self._grasp_boxes(source)
-            grasp_box = self._enclosing_grasp_box(source, grasp_boxes)
-            matrix = torch.eye(4, dtype=torch.float, device=self.device)
-            matrix[:3, :3] = quaternion_to_matrix(quaternion)
-            matrix[:3, 3] = torch.tensor(
-                source["target_points"], dtype=torch.float, device=self.device
-            )
+            geometry = self._record_geometry(env_id, source)
+            grasp_boxes = geometry["grasp_boxes"]
+            grasp_box = geometry["grasp_box"]
+            matrix = geometry["grasp_mat"]
+            approach_vector = matrix[:3, 2].copy()
+            approach_vector /= max(float(np.linalg.norm(approach_vector)), 1.0e-12)
             record = {
                 "grasp_box": grasp_box.round(7).tolist(),
                 "grasp_boxes": grasp_boxes.round(7).tolist(),
-                "grasp_mat": matrix.detach().cpu().numpy().round(7).tolist(),
-                "target_points": copy.deepcopy(source["target_points"]),
-                "target_orientation": copy.deepcopy(source["target_orientation"]),
-                "target_width": copy.deepcopy(source.get("target_width", 0.0)),
+                "grasp_mat": matrix.round(7).tolist(),
+                # Gripper approach is local +Z. Keep it separate from `normal`,
+                # which is the randomized external-force test direction.
+                "approach_vector": approach_vector.round(7).tolist(),
+                "target_points": geometry["target_points"].round(7).tolist(),
+                "target_orientation": geometry["target_orientation"].round(7).tolist(),
+                "grasp_orientation_wxyz": geometry[
+                    "grasp_orientation_wxyz"
+                ].round(8).tolist(),
+                "grasp_orientation_rpy_deg": geometry[
+                    "grasp_orientation_rpy_deg"
+                ].round(7).tolist(),
+                "gripper_yaw_deg": round(float(geometry["gripper_yaw_deg"]), 7),
+                "target_width": round(float(geometry["target_width"]), 7),
+                "attempt_target_points": copy.deepcopy(source["target_points"]),
+                "attempt_target_orientation": copy.deepcopy(
+                    source["target_orientation"]
+                ),
+                "attempt_target_width": copy.deepcopy(source.get("target_width", 0.0)),
                 "target_object": source["target_object"],
                 "source_pregrasp_index": source_id,
                 "gripper_model": self.gripper["gripper_name"],
@@ -973,10 +1223,24 @@ class GraspPolicy:
                 "stress_center_score": round(stress_center_score, 6),
                 "pregrasp_rotation_score": round(pregrasp_rotation_score, 6),
                 "stress_rotation_score": round(stress_rotation_score, 6),
-                "normal": self.force_direction[env_id].detach().cpu().numpy().round(7).tolist(),
+                "normal": geometry["force_direction"].round(7).tolist(),
                 "quality": {
                     "result": result,
                     "test_sequence": "close_then_stress",
+                    "grasp_record_mode": self.grasp_record_mode,
+                    "grasp_complete_width_m": round(
+                        float(self.grasp_complete_width[env_id]), 7
+                    ) if not self.is_hand else None,
+                    "grasp_complete_joint_pos_rad": {
+                        name: round(float(value), 7)
+                        for name, value in zip(
+                            self.joint_names,
+                            self.grasp_complete_joint[env_id].tolist(),
+                        )
+                    },
+                    "object_motion_restore_mat": geometry[
+                        "restore_transform"
+                    ].round(7).tolist(),
                     "score_weights": {
                         "force": FORCE_SCORE_WEIGHT,
                         "pregrasp_pose": PREGRASP_POSE_SCORE_WEIGHT,
@@ -1046,6 +1310,13 @@ class GraspPolicy:
                     "finger_z_hop_enabled": self.apply_finger_z_hop,
                 },
             }
+            if "initial_object_matrix" in geometry:
+                record["quality"]["object_initial_mat"] = geometry[
+                    "initial_object_matrix"
+                ].round(7).tolist()
+                record["quality"]["object_grasp_complete_mat"] = geometry[
+                    "complete_object_matrix"
+                ].round(7).tolist()
             for key in (
                 "preset_name", "target_base_tf", "target_joint_pos", "joint_unit",
                 "transition", "selected_heightmap_yaw", "first_contact_z",
@@ -1061,6 +1332,18 @@ class GraspPolicy:
                 {
                     "source_pregrasp_index": source_id,
                     "result": result,
+                    "grasp_record_mode": self.grasp_record_mode,
+                    "grasp_complete_width_m": (
+                        float(self.grasp_complete_width[env_id])
+                        if not self.is_hand else None
+                    ),
+                    "grasp_complete_joint_pos_rad": {
+                        name: float(value)
+                        for name, value in zip(
+                            self.joint_names,
+                            self.grasp_complete_joint[env_id].tolist(),
+                        )
+                    },
                     "score": score,
                     "force_score": survival,
                     "contact_area_score": contact_area_score,

@@ -81,6 +81,13 @@ def main(
     # 같은 pregrasp A/B에서 False가 더 작은 최악 관통값을 보였다.
     APPLY_FINGER_Z_HOP = True
 
+    # "attempt": 기존처럼 시도한 pregrasp pose와 target_width를 저장한다.
+    # "grasp_complete_restored": 시도한 width는 유지하고 외력 직전 pose를
+    # 닫힘 동안 움직인 물체의 초기 pose로 되돌린 좌표에 저장한다.
+    GRASP_RECORD_MODE = "grasp_complete_restored"
+    # None이면 mode와 관계없이 output_grasp를 사용한다.
+    OUTPUT_GRASP_FOLDER: str | None = None
+
     HEADLESS = True
     # "cuda:0" = GPU PhysX, "cpu" = CPU PhysX.
     # AppLauncher와 SimulationCfg 양쪽에 동일하게 적용된다.
@@ -113,9 +120,16 @@ def main(
 
 
     scene_id = f"{SCENE:04d}"
+    normalized_record_mode = str(GRASP_RECORD_MODE).strip().lower()
+    if normalized_record_mode not in {"attempt", "grasp_complete_restored"}:
+        raise ValueError(
+            "GRASP_RECORD_MODE must be 'attempt' or "
+            "'grasp_complete_restored'"
+        )
+    output_folder = OUTPUT_GRASP_FOLDER or "output_grasp"
     pregrasp_path = ROOT / "pre_grasp" / f"{scene_id}.json"
     conf_path = ROOT / "conf" / f"{scene_id}.json"
-    output_path = ROOT / "output_grasp" / f"{scene_id}.json"
+    output_path = ROOT / output_folder / f"{scene_id}.json"
     if output_path.exists() and not OVERWRITE:
         raise FileExistsError(f"output already exists: {output_path}; set OVERWRITE=True")
     group = select_group(load_json(pregrasp_path))
@@ -140,7 +154,6 @@ def main(
     )
     if normalized_device != "cpu" and not valid_cuda_device:
         raise ValueError("DEVICE must be 'cpu', 'cuda', or 'cuda:<index>'")
-
     launcher = AppLauncher(
         headless=HEADLESS, device=normalized_device, enable_cameras=False
     )
@@ -222,6 +235,7 @@ def main(
         cfg.root_max_linear_speed = float(ROOT_MAX_LINEAR_SPEED)
         cfg.root_max_angular_speed = math.radians(float(ROOT_MAX_ANGULAR_SPEED_DEG))
         cfg.apply_finger_z_hop = bool(APPLY_FINGER_Z_HOP)
+        cfg.grasp_record_mode = normalized_record_mode
         cfg.envs = ENVS
         cfg.scene.num_envs = ENVS
         configure_object(cfg.scene, conf.get("objects", []))
@@ -235,6 +249,7 @@ def main(
             f"print_delta={CONTACT_SEPARATION_PRINT_DELTA_MM:.4f}mm",
             flush=True,
         )
+        print(f"Grasp > record_mode={normalized_record_mode}", flush=True)
         env = grasp_env.RobotEnv(
             cfg=cfg,
             pre_grasp_data=records,

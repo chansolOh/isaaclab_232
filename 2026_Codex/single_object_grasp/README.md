@@ -38,6 +38,7 @@
 ```
 
 즉 데이터 루트 순서는 `물체/그리퍼 종류/데이터 종류`이다.
+두 수집 mode 모두 결과는 `output_grasp`에 저장한다.
 
 ## 1. conf + pre-grasp 일괄 생성
 
@@ -97,6 +98,30 @@ cd /home/uon/ochansol/isaaclab_232/2026_Codex/single_object_grasp
 `ENVS`, `HEADLESS`에서 설정한다. 기본 병렬 수는 기존 수집기와 같은 20개다. 물리 timestep과 action 주기는 각각
 `SIM_DT`, `DECIMATION`으로 설정하며 실제 policy 주기는
 `SIM_DT * DECIMATION`이다.
+
+저장 기준은 `GRASP_RECORD_MODE`로 고른다.
+
+- `"attempt"`: 기존 방식이다. 시도한 pregrasp의 pose와 `target_width`를
+  그대로 `output_grasp`에 저장한다.
+- `"grasp_complete_restored"`: 처음 시도한 pregrasp width로 bbox를 만들고,
+  완료 시점의 실제 gripper pose를 쓴다. 물체의
+  초기 pose를 `T0`, 파지 완료 pose를 `T1`이라 하면 bbox, `grasp_mat`,
+  `target_points`, `approach_vector`, `normal`과 gripper orientation/yaw에
+  `T0 @ inv(T1)`을 적용하여 물체를 초기 자세로 복원한 좌표로
+  `output_grasp`에 저장한다. `approach_vector`는 변환된
+  `grasp_mat`의 local +Z축에서 다시 계산한다.
+
+`OUTPUT_GRASP_FOLDER`가 `None`이면 두 mode 모두 `output_grasp`를 사용한다.
+finger2/finger3의 `target_width`와 bbox 폭은 처음 시도한 width를 유지한다.
+실제 완료 joint에서 계산한 폭은 geometry에는 사용하지 않고
+`quality.grasp_complete_width_m` 진단값으로만 남긴다.
+hand는 하나의 width가 없으므로 기존 fingertip `grasp_bbox`를 완료 물체 pose의
+역변환으로 복원한다. 원래 시도값은 `attempt_target_points`,
+`attempt_target_orientation`, `attempt_target_width`에 남는다. 복원된 방향은
+`target_orientation`, `grasp_orientation_wxyz`,
+`grasp_orientation_rpy_deg`, `gripper_yaw_deg`에 저장하고, 변환 행렬은
+`quality.object_motion_restore_mat`에 함께 남는다. 병합 시에도 변환된
+`grasp_mat`에서 방향 필드를 다시 계산하므로 object zero pose와 일치한다.
 
 관통 억제/검사는 같은 설정부의 `ENABLE_CCD`,
 `PHYSX_SOLVE_ARTICULATION_CONTACT_LAST`, `CONTACT_OFFSET_MM`, `REST_OFFSET_MM`,
@@ -194,6 +219,9 @@ contact force가 저장된다.
 fingertip `grasp_bbox` 전체가 들어간다. 기존 도구 호환용 `grasp_box`에는 이들을
 모두 감싸는 대표 사각형을 유지한다. 병합 NPZ는 가변 개수를
 `grasp_boxes_flat`과 `grasp_boxes_offsets`로 저장한다.
+`approach_vector`에는 `grasp_mat`의 local +Z축인 그리퍼 접근 방향을 별도로
+저장한다. 이는 bbox 평면에 수직이며, 무작위 외력 시험 방향인 `normal`과는
+다른 값이다.
 외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
 상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
 contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
@@ -220,9 +248,11 @@ contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
 /home/uon/ochansol/isaaclab_232/.venv/bin/python replay_grasps.py
 ```
 
-`output_grasp/<scene>.json`의 저장 순서로 하나씩 재생한다.
+`GRASP_DIR_NAME`으로 고른 grasp 폴더의 `<scene>.json` 저장 순서로 하나씩 재생한다.
 각 grasp의 `source_pregrasp_index`로 원본 pregrasp를 찾고, 접근→닫기→외력
 시험을 다시 수행하며 저장된 `normal`을 같은 외력 방향으로 사용한다.
+record mode와 관계없이 시뮬레이션 동작은 원본 pregrasp 기준으로 재현하며,
+복원된 `grasp_mat`과 `approach_vector`는 debug draw 데이터로만 표시한다.
 종료되면 마지막 물리 상태에서 자동 reset하지 않고 멈춘다.
 Isaac Sim debug draw로 저장된 `grasp_box`를 빨간/점수 색 선으로,
 `normal`을 자주색 선으로, `grasp_mat` frame을 RGB 축으로,
@@ -247,9 +277,44 @@ Isaac Sim debug draw로 저장된 `grasp_box`를 빨간/점수 색 선으로,
 python3 merge_grasps.py
 ```
 
-병합 경로와 필터값은 `merge_grasps.py` 상단의 `ROOT`, `SCENE_START`,
-`SCENE_END`, `SCORE_THRESHOLD` 등에서 설정한다.
+병합 경로와 필터값은 `merge_grasps.py` 상단의 `ROOT`, `GRASP_DIR_NAME`,
+`SCENE_START`, `SCENE_END`, `SCORE_THRESHOLD` 등에서 설정한다.
 
 `merge_grasps.py`는 각 물체 자세의 grasp를 object zero pose로 변환한다. 기본으로
 `score >= 0.25`를 남긴 다음 empty-box filter와 NMS를 적용한다. 한 conf에는
 `objects`가 정확히 하나 있어야 한다.
+
+## 5. 병합 필터 GUI 및 수동 검수
+
+```bash
+/home/uon/ochansol/isaac_code/isaac_chansol/.venv/bin/python filter_grasps_gui.py
+```
+
+`filter_grasps_gui.py` 상단의 `ROOT`, `GRASP_DIR_NAME`을 수정하거나 GUI의
+`폴더 선택`, `Grasp 폴더` 입력으로
+`<output-root>/<object>/<gripper>` 폴더를 연다. 모든 scene의 grasp를 object
+zero pose로 변환한 뒤 다음 항목을 각각 켜고 끄거나 수치를 바꿀 수 있다.
+
+- completed 여부와 총점/외력/파지 자세/외력 중 자세/접촉면 점수의 최소값
+- empty bbox의 두께, 여유, 물체 정점이 포함되어야 하는 최소 손가락 bbox 수
+- NMS 중심 거리, 회전 거리 및 NMS에서 우선할 점수
+- 표시 정렬 기준과 오름차순/내림차순
+
+Scene 범위나 `Mesh scale`을 바꾼 경우 `다시 불러오기`를 누른다. 나머지
+필터값은 `필터 적용`만 누르면 다시 계산된다.
+
+별도 Open3D 창은 물체 mesh와 현재 grasp의 모든 `grasp_boxes`, normal,
+grasp frame을 표시한다. 모든 선은 하나의 Open3D `LineSet`으로 묶어서 갱신한다.
+3D VIEW에서 `현재 1개`, `필터 전체`, `승인만`, `제외만`을 바로 선택할 수 있다.
+전체 보기는 개수 제한 없이 모든 필터 통과 bbox를 한 번에 표시하며, 현재 정렬
+점수에 따라 blue→green→yellow 색을 사용한다. 주황색 화살표는 bbox에 수직인
+`approach_vector`, 자주색 선은 외력 시험의 `normal`이다. `Left/Right`는 이전/다음,
+`PageUp/PageDown`은 10개 이동,
+`A/R/U`는 승인/제외/보류다. 이 키들은 Tk 제어창과 Open3D 창 양쪽에서
+동작하며, Tk 입력칸에 포커스가 있을 때는 오작동하지 않는다. 검수 상태는
+`<object>_grasp_review.json`으로 별도 저장하고 다시 불러올 수 있다.
+숫자 `1/2/3/4`로 현재 1개/필터 전체/승인만/제외만 보기를 즉시 전환한다.
+
+최종 저장은 현재 필터를 통과한 항목에서 수동 제외 항목을 제거한다.
+`승인한 항목만 저장`을 켜면 수동 승인한 항목만 저장한다. `Ctrl+S` 또는 저장
+버튼으로 metadata가 포함된 JSON과 같은 이름의 NPZ를 함께 생성한다.

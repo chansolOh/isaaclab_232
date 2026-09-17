@@ -398,6 +398,7 @@ class RobotEnvCfg(DirectRLEnvCfg):
     root_max_linear_speed = 0.5
     root_max_angular_speed = math.radians(180.0)
     apply_finger_z_hop = False
+    grasp_record_mode = "attempt"
 
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 800.0,
@@ -505,6 +506,7 @@ class RobotEnv(DirectRLEnv):
             max_relative_rotation_deg=cfg.max_relative_rotation_deg,
             contact_lost_duration=cfg.contact_lost_duration,
             apply_finger_z_hop=cfg.apply_finger_z_hop,
+            grasp_record_mode=cfg.grasp_record_mode,
         )
         # Compatibility with the legacy main loop.
         self.act_pol = self.policy
@@ -1028,6 +1030,7 @@ class RobotEnv(DirectRLEnv):
             max_relative_rotation_deg=self.cfg.max_relative_rotation_deg,
             contact_lost_duration=self.cfg.contact_lost_duration,
             apply_finger_z_hop=self.cfg.apply_finger_z_hop,
+            grasp_record_mode=self.cfg.grasp_record_mode,
         )
         self.act_pol = self.policy
 

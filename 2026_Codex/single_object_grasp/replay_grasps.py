@@ -16,14 +16,16 @@ from isaaclab.app import AppLauncher
 ROOT = Path(
     "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/"
     "black_pepper_shaker/"
-    "Robotiq_2f140"#"UON_3finger_gripper"
+    "UON_3finger_gripper"#"UON_3finger_gripper"
 )
 SCENE = 0
+# collect_grasps.py의 GRASP_RECORD_MODE에 맞춰 선택한다.
+GRASP_DIR_NAME = "output_grasp"
 
 FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
 HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-# output_grasp JSON에 정렬되어 저장된 순서를 사용한다.
+# GRASP_DIR_NAME으로 선택한 JSON에 정렬되어 저장된 순서를 사용한다.
 START_GRASP_INDEX = 0
 END_GRASP_INDEX = None
 STRIDE = 1
@@ -213,7 +215,7 @@ def draw_saved_grasp(draw, grasp: dict, score_field: str = "pose_score") -> None
 scene_id = f"{int(SCENE):04d}"
 conf_path = ROOT / "conf" / f"{scene_id}.json"
 pregrasp_path = ROOT / "pre_grasp" / f"{scene_id}.json"
-grasp_path = ROOT / "output_grasp" / f"{scene_id}.json"
+grasp_path = ROOT / GRASP_DIR_NAME / f"{scene_id}.json"
 
 conf = load_json(conf_path)
 pregrasp_group = select_pregrasp_group(load_json(pregrasp_path))

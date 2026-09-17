@@ -29,6 +29,8 @@ ROOT = Path(
 )
 SCENE_START: int | None = None
 SCENE_END: int | None = None
+# 두 record mode 모두 기본 output_grasp를 사용한다.
+GRASP_DIR_NAME = "output_grasp"
 
 SCORE_THRESHOLD = 0.25
 REQUIRE_COMPLETED = True
@@ -53,7 +55,8 @@ def load_json(path: Path):
 def selected_scene_ids() -> list[str]:
     conf_ids = {path.stem for path in (ROOT / "conf").glob("[0-9][0-9][0-9][0-9].json")}
     output_ids = {
-        path.stem for path in (ROOT / "output_grasp").glob("[0-9][0-9][0-9][0-9].json")
+        path.stem
+        for path in (ROOT / GRASP_DIR_NAME).glob("[0-9][0-9][0-9][0-9].json")
     }
     result = sorted(conf_ids & output_ids)
     if SCENE_START is not None:
@@ -112,6 +115,27 @@ def matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
     return quaternion if quaternion[0] >= 0 else -quaternion
 
 
+def matrix_to_euler_xyz_degrees(matrix: np.ndarray) -> np.ndarray:
+    """Return XYZ Euler angles for R = Rz(yaw) Ry(pitch) Rx(roll)."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    horizontal = np.hypot(matrix[0, 0], matrix[1, 0])
+    if horizontal > 1.0e-9:
+        roll = np.arctan2(matrix[2, 1], matrix[2, 2])
+        pitch = np.arctan2(-matrix[2, 0], horizontal)
+        yaw = np.arctan2(matrix[1, 0], matrix[0, 0])
+    else:
+        roll = np.arctan2(-matrix[1, 2], matrix[1, 1])
+        pitch = np.arctan2(-matrix[2, 0], horizontal)
+        yaw = 0.0
+    return np.degrees(np.asarray([roll, pitch, yaw], dtype=np.float64))
+
+
+def target_rotation_from_grasp(rotation: np.ndarray, gripper_type: str) -> np.ndarray:
+    if str(gripper_type).strip().lower().startswith("finger"):
+        return rotation @ np.diag([1.0, -1.0, -1.0])
+    return rotation
+
+
 def transform_points(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
     homogeneous = np.column_stack((points.reshape(-1, 3), np.ones(points.size // 3)))
@@ -141,7 +165,24 @@ def to_zero_pose(item: dict, obj_conf: dict, scene_id: str) -> dict | None:
     if "grasp_mat" in item:
         matrix = np.asarray(item["grasp_mat"], dtype=np.float64)
         if matrix.shape == (4, 4):
-            result["grasp_mat"] = (inverse @ matrix).round(7).tolist()
+            transformed_matrix = inverse @ matrix
+            result["grasp_mat"] = transformed_matrix.round(7).tolist()
+            rotation = transformed_matrix[:3, :3]
+            approach = rotation[:, 2].copy()
+            approach /= max(float(np.linalg.norm(approach)), 1e-12)
+            result["approach_vector"] = approach.round(7).tolist()
+            grasp_rpy = matrix_to_euler_xyz_degrees(rotation)
+            result["grasp_orientation_wxyz"] = (
+                matrix_to_quaternion(rotation).round(8).tolist()
+            )
+            result["grasp_orientation_rpy_deg"] = grasp_rpy.round(7).tolist()
+            result["gripper_yaw_deg"] = round(float(grasp_rpy[2]), 7)
+            target_rotation = target_rotation_from_grasp(
+                rotation, result.get("gripper_type", "")
+            )
+            result["target_orientation"] = (
+                matrix_to_euler_xyz_degrees(target_rotation).round(7).tolist()
+            )
     points = np.asarray(item.get("target_points", []), dtype=np.float64)
     if points.shape == (3,):
         result["target_points"] = transform_points(inverse, points[None])[0].round(7).tolist()
@@ -289,6 +330,41 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
     normals = np.asarray(
         [item.get("normal", [np.nan] * 3) for item in items], dtype=np.float32
     ).reshape(-1, 3)
+    approach_vectors = matrices[:, :3, 2].copy()
+    approach_norms = np.linalg.norm(approach_vectors, axis=1, keepdims=True)
+    approach_vectors /= np.maximum(approach_norms, 1.0e-12)
+    grasp_quaternions = np.asarray(
+        [
+            item.get(
+                "grasp_orientation_wxyz",
+                matrix_to_quaternion(matrix[:3, :3]),
+            )
+            for item, matrix in zip(items, matrices)
+        ],
+        dtype=np.float32,
+    ).reshape(-1, 4)
+    grasp_rpy_degrees = np.asarray(
+        [
+            item.get(
+                "grasp_orientation_rpy_deg",
+                matrix_to_euler_xyz_degrees(matrix[:3, :3]),
+            )
+            for item, matrix in zip(items, matrices)
+        ],
+        dtype=np.float32,
+    ).reshape(-1, 3)
+    gripper_yaw_degrees = grasp_rpy_degrees[:, 2].copy()
+    target_orientations = np.asarray(
+        [item.get("target_orientation", [np.nan] * 3) for item in items],
+        dtype=np.float32,
+    ).reshape(-1, 3)
+    target_points = np.asarray(
+        [item.get("target_points", [np.nan] * 3) for item in items],
+        dtype=np.float32,
+    ).reshape(-1, 3)
+    target_widths = np.asarray(
+        [item.get("target_width", np.nan) for item in items], dtype=np.float32
+    )
     temporary = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.npz")
     np.savez_compressed(
         temporary,
@@ -299,6 +375,12 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
         grasp_mat=matrices,
         grasp_center=centers,
         rotation_matrix=matrices[:, :3, :3],
+        grasp_orientation_wxyz=grasp_quaternions,
+        grasp_orientation_rpy_deg=grasp_rpy_degrees,
+        gripper_yaw_deg=gripper_yaw_degrees,
+        target_orientation=target_orientations,
+        target_points=target_points,
+        target_width=target_widths,
         score=scores,
         rotation_score=rotation_scores,
         pose_score=pose_scores,
@@ -311,6 +393,8 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
         pregrasp_rotation_score=pregrasp_rotation_scores,
         stress_rotation_score=stress_rotation_scores,
         normal=normals,
+        approach_vector=approach_vectors,
+        approach_vector_opposite=-approach_vectors,
         scene_id=np.asarray([item["scene_id"] for item in items]),
         gripper_model=np.asarray([item["gripper_model"] for item in items]),
     )
@@ -320,7 +404,7 @@ def save_npz(path: Path, metadata: dict, items: list[dict]) -> None:
 def main() -> None:
     scene_ids = selected_scene_ids()
     if not scene_ids:
-        raise RuntimeError("No scene has both conf and output_grasp JSON")
+        raise RuntimeError(f"No scene has both conf and {GRASP_DIR_NAME} JSON")
     merged = []
     reference_obj = None
     for scene_id in scene_ids:
@@ -329,7 +413,7 @@ def main() -> None:
             raise ValueError(f"scene {scene_id} is not single-object")
         obj = conf["objects"][0]
         reference_obj = reference_obj or obj
-        for item in load_json(ROOT / "output_grasp" / f"{scene_id}.json"):
+        for item in load_json(ROOT / GRASP_DIR_NAME / f"{scene_id}.json"):
             if (
                 REQUIRE_COMPLETED
                 and item.get("quality", {}).get("result") != "completed"
@@ -362,12 +446,18 @@ def main() -> None:
     if USE_NMS:
         merged = nms(merged, NMS_CENTER, NMS_ROTATION_DEG)
     object_name = reference_obj["class"]
-    output_json = OUTPUT_JSON or ROOT / f"{object_name}_merged_grasp_zero_pose.json"
-    output_npz = OUTPUT_NPZ or ROOT / f"{object_name}_merged_grasp_zero_pose.npz"
+    source_label = GRASP_DIR_NAME.removeprefix("output_grasp").strip("_")
+    source_suffix = "" if not source_label else f"_{source_label}"
+    output_stem = f"{object_name}_merged_grasp{source_suffix}_zero_pose"
+    output_json = OUTPUT_JSON or ROOT / f"{output_stem}.json"
+    output_npz = OUTPUT_NPZ or ROOT / f"{output_stem}.npz"
     metadata = {
         "object": object_name,
+        "source_grasp_directory": GRASP_DIR_NAME,
         "scene_ids": scene_ids,
         "score_threshold": SCORE_THRESHOLD,
+        "approach_axis_index": 2,
+        "approach_axis_sign": 1.0,
         "counts": {
             "after_score": after_score,
             "after_empty_box": after_empty,
