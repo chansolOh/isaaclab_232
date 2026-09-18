@@ -30,13 +30,13 @@ def main(
     FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
     HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-    ENVS = 20
+    ENVS = 200
     SEED = 42
     START_INDEX = 0
     MINIMUM_RECORDS = 2
     RETRIES = 0
-    OVERWRITE = True
-    DEBUG = True
+    OVERWRITE = False
+    DEBUG = False
     DEBUG_GRASP_LINE_WIDTH = 5.0
     DEBUG_VECTOR_LENGTH = 0.08
 
@@ -87,7 +87,7 @@ def main(
     # None이면 mode와 관계없이 output_grasp를 사용한다.
     OUTPUT_GRASP_FOLDER: str | None = None
 
-    HEADLESS = False
+    HEADLESS = True
     # "cuda:0" = GPU PhysX, "cpu" = CPU PhysX.
     # AppLauncher와 SimulationCfg 양쪽에 동일하게 적용된다.
     DEVICE = "cpu"
