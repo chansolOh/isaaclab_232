@@ -46,8 +46,6 @@ OVERRIDE_GRIPPER_COLLISION_OFFSETS = True
 ENABLE_OBJECT_CONTACT_SENSOR = True
 CONTACT_MAX_DATA_COUNT_PER_PRIM = 4096
 PRE_STRESS_OBJECT_MOTION_THRESHOLD = 0.1
-MAX_RELATIVE_TRANSLATION_M = 0.010
-MAX_RELATIVE_ROTATION_DEG = 20.0
 CONTACT_LOST_DURATION_S = 0.10
 ROOT_MAX_LINEAR_SPEED = 0.25
 ROOT_MAX_ANGULAR_SPEED_DEG = 90.0
@@ -315,8 +313,6 @@ try:
     cfg.pre_stress_object_motion_threshold = float(
         PRE_STRESS_OBJECT_MOTION_THRESHOLD
     )
-    cfg.max_relative_translation = float(MAX_RELATIVE_TRANSLATION_M)
-    cfg.max_relative_rotation_deg = float(MAX_RELATIVE_ROTATION_DEG)
     cfg.contact_lost_duration = float(CONTACT_LOST_DURATION_S)
     cfg.root_max_linear_speed = float(ROOT_MAX_LINEAR_SPEED)
     cfg.root_max_angular_speed = math.radians(float(ROOT_MAX_ANGULAR_SPEED_DEG))

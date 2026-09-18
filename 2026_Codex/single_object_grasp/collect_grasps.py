@@ -6,6 +6,7 @@ def main(
         object_name: str,
         Gripper_name: str,
         scene_num: int,
+        root_path: str = "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen",
 ):
 
     from collections import Counter
@@ -23,22 +24,21 @@ def main(
     # 실행 설정: 이 부분만 수정해서 사용한다.
     # ROOT는 <output-root>/<object>/<gripper> 폴더다.
     # -----------------------------------------------------------------------------
-    ROOT = Path(
-        "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/"
-        f"{object_name}/{Gripper_name}"
-    )
+    ROOT = Path(root_path) / object_name / Gripper_name
     SCENE = scene_num
 
     FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
     HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-    ENVS = 200
+    ENVS = 20
     SEED = 42
     START_INDEX = 0
     MINIMUM_RECORDS = 2
     RETRIES = 0
-    OVERWRITE = False
-    DEBUG = False
+    OVERWRITE = True
+    DEBUG = True
+    DEBUG_GRASP_LINE_WIDTH = 5.0
+    DEBUG_VECTOR_LENGTH = 0.08
 
     # Physics는 SIM_DT 간격으로 진행하고 policy/action은 DECIMATION step마다 갱신한다.
     SIM_DT = 1.0 / 800.0
@@ -65,9 +65,8 @@ def main(
     # APPROACH/CLOSE 중 물체가 초기 pose에서 이 이상 이동하면 transient
     # contact report 유무와 관계없이 충돌 실패로 처리한다.
     PRE_STRESS_OBJECT_MOTION_THRESHOLD = 0.1
-    # 외력 시험 중 이 범위를 넘게 미끄러지거나 접촉을 연속 상실하면 실패다.
-    MAX_RELATIVE_TRANSLATION_M = 0.010
-    MAX_RELATIVE_ROTATION_DEG = 20.0
+    # 외력 시험 중 contact가 이 시간 이상 연속으로 사라질 때만 놓침 실패다.
+    # 위치와 회전 변화는 score에만 반영하며 성공/실패 조건으로 사용하지 않는다.
     CONTACT_LOST_DURATION_S = 0.10
     CONTACT_MAX_DATA_COUNT_PER_PRIM = 4096
     PRINT_CONTACT_SEPARATION = False
@@ -88,7 +87,7 @@ def main(
     # None이면 mode와 관계없이 output_grasp를 사용한다.
     OUTPUT_GRASP_FOLDER: str | None = None
 
-    HEADLESS = True
+    HEADLESS = False
     # "cuda:0" = GPU PhysX, "cpu" = CPU PhysX.
     # AppLauncher와 SimulationCfg 양쪽에 동일하게 적용된다.
     DEVICE = "cpu"
@@ -180,8 +179,6 @@ def main(
             raise ValueError("CONTACT_OFFSET_MM must exceed both zero and REST_OFFSET_MM")
         if CONTACT_PENETRATION_THRESHOLD_MM < 0.0:
             raise ValueError("CONTACT_PENETRATION_THRESHOLD_MM must be non-negative")
-        if MAX_RELATIVE_TRANSLATION_M <= 0.0 or MAX_RELATIVE_ROTATION_DEG <= 0.0:
-            raise ValueError("Stress-test drift thresholds must be positive")
         if CONTACT_LOST_DURATION_S <= 0.0:
             raise ValueError("CONTACT_LOST_DURATION_S must be positive")
         if CONTACT_MAX_DATA_COUNT_PER_PRIM < 1:
@@ -224,8 +221,6 @@ def main(
         cfg.pre_stress_object_motion_threshold = float(
             PRE_STRESS_OBJECT_MOTION_THRESHOLD
         )
-        cfg.max_relative_translation = float(MAX_RELATIVE_TRANSLATION_M)
-        cfg.max_relative_rotation_deg = float(MAX_RELATIVE_ROTATION_DEG)
         cfg.contact_lost_duration = float(CONTACT_LOST_DURATION_S)
         cfg.contact_max_data_count_per_prim = int(CONTACT_MAX_DATA_COUNT_PER_PRIM)
         cfg.print_contact_separation = bool(PRINT_CONTACT_SEPARATION)
@@ -236,6 +231,9 @@ def main(
         cfg.root_max_angular_speed = math.radians(float(ROOT_MAX_ANGULAR_SPEED_DEG))
         cfg.apply_finger_z_hop = bool(APPLY_FINGER_Z_HOP)
         cfg.grasp_record_mode = normalized_record_mode
+        cfg.draw_successful_grasps = bool(DEBUG and not HEADLESS)
+        cfg.debug_grasp_line_width = float(DEBUG_GRASP_LINE_WIDTH)
+        cfg.debug_vector_length = float(DEBUG_VECTOR_LENGTH)
         cfg.envs = ENVS
         cfg.scene.num_envs = ENVS
         configure_object(cfg.scene, conf.get("objects", []))

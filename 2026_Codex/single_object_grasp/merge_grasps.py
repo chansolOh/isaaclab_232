@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from grasp.mesh_geometry import (
+    euler_xyz_degrees_to_matrix,
     load_obj_triangles,
     object_pose_matrix,
     quaternion_wxyz_to_matrix,
@@ -149,6 +150,48 @@ def transform_pose_dict(pose: dict, inverse: np.ndarray) -> dict:
     result["position"] = position.round(7).tolist()
     result["orientation_wxyz"] = matrix_to_quaternion(rotation).round(8).tolist()
     result.pop("rpy_deg", None)
+    return result
+
+
+def pregrasp_to_zero_pose(pregrasp: dict, obj_conf: dict) -> dict:
+    """Convert the exact replay input from scene/world space to object space."""
+    inverse = np.linalg.inv(object_pose_matrix(obj_conf))
+    result = copy.deepcopy(pregrasp)
+
+    points = np.asarray(pregrasp.get("target_points", []), dtype=np.float64)
+    if points.shape == (3,):
+        result["target_points"] = (
+            transform_points(inverse, points[None])[0].round(7).tolist()
+        )
+
+    orientation = np.asarray(
+        pregrasp.get("target_orientation", []), dtype=np.float64
+    )
+    if orientation.shape == (3,):
+        rotation = inverse[:3, :3] @ euler_xyz_degrees_to_matrix(orientation)
+        result["target_orientation"] = (
+            matrix_to_euler_xyz_degrees(rotation).round(7).tolist()
+        )
+
+    target_base = pregrasp.get("target_base_tf")
+    if isinstance(target_base, dict):
+        result["target_base_tf"] = {
+            phase: transform_pose_dict(pose, inverse)
+            for phase, pose in target_base.items()
+            if isinstance(pose, dict)
+            and "position" in pose
+            and "orientation_wxyz" in pose
+        }
+
+    result["coordinate_frame"] = "object_zero_pose"
+    return result
+
+
+def zero_pose_object_config(obj_conf: dict) -> dict:
+    """Keep asset/scale information while removing a sampled scene pose."""
+    result = copy.deepcopy(obj_conf)
+    result["translate"] = [0.0, 0.0, 0.0]
+    result["orient"] = [1.0, 0.0, 0.0, 0.0]
     return result
 
 
@@ -413,6 +456,18 @@ def main() -> None:
             raise ValueError(f"scene {scene_id} is not single-object")
         obj = conf["objects"][0]
         reference_obj = reference_obj or obj
+        pregrasp_payload = load_json(ROOT / "pre_grasp" / f"{scene_id}.json")
+        if isinstance(pregrasp_payload, dict):
+            pregrasp_groups = [pregrasp_payload]
+        elif isinstance(pregrasp_payload, list):
+            pregrasp_groups = pregrasp_payload
+        else:
+            raise ValueError(f"scene {scene_id}: invalid pre_grasp JSON")
+        if len(pregrasp_groups) != 1 or not isinstance(
+            pregrasp_groups[0].get("data"), list
+        ):
+            raise ValueError(f"scene {scene_id}: expected one pre_grasp group")
+        pregrasps = pregrasp_groups[0]["data"]
         for item in load_json(ROOT / GRASP_DIR_NAME / f"{scene_id}.json"):
             if (
                 REQUIRE_COMPLETED
@@ -423,6 +478,15 @@ def main() -> None:
                 continue
             transformed = to_zero_pose(item, obj, scene_id)
             if transformed is not None:
+                source_index = int(item["source_pregrasp_index"])
+                if not 0 <= source_index < len(pregrasps):
+                    raise IndexError(
+                        f"scene {scene_id}: source_pregrasp_index={source_index} "
+                        f"outside 0..{len(pregrasps) - 1}"
+                    )
+                transformed["replay_pregrasp"] = pregrasp_to_zero_pose(
+                    pregrasps[source_index], obj
+                )
                 merged.append(transformed)
     after_score = len(merged)
     if EMPTY_BOX_FILTER:
@@ -458,6 +522,8 @@ def main() -> None:
         "score_threshold": SCORE_THRESHOLD,
         "approach_axis_index": 2,
         "approach_axis_sign": 1.0,
+        "object_config_zero_pose": zero_pose_object_config(reference_obj),
+        "replay_schema_version": 1,
         "counts": {
             "after_score": after_score,
             "after_empty_box": after_empty,

@@ -99,6 +99,12 @@ cd /home/uon/ochansol/isaaclab_232/2026_Codex/single_object_grasp
 `SIM_DT`, `DECIMATION`으로 설정하며 실제 policy 주기는
 `SIM_DT * DECIMATION`이다.
 
+`HEADLESS=False`이고 `DEBUG=True`일 때 성공 판정된 grasp를 각 병렬 env
+위치에 누적해서 그린다. `HEADLESS=True`이면 debug draw는 비활성화된다. 초록색은
+`grasp_boxes`, 파란색은 복원된 `approach_vector`, 자홍색은 외력 방향
+`normal`이다. 선 굵기와 벡터 길이는 `DEBUG_GRASP_LINE_WIDTH`,
+`DEBUG_VECTOR_LENGTH`로 설정한다.
+
 저장 기준은 `GRASP_RECORD_MODE`로 고른다.
 
 - `"attempt"`: 기존 방식이다. 시도한 pregrasp의 pose와 `target_width`를
@@ -222,10 +228,12 @@ fingertip `grasp_bbox` 전체가 들어간다. 기존 도구 호환용 `grasp_bo
 `approach_vector`에는 `grasp_mat`의 local +Z축인 그리퍼 접근 방향을 별도로
 저장한다. 이는 bbox 평면에 수직이며, 무작위 외력 시험 방향인 `normal`과는
 다른 값이다.
-외력 시험 중 상대 이동이 `MAX_RELATIVE_TRANSLATION_M`(기본 10 mm),
-상대 회전이 `MAX_RELATIVE_ROTATION_DEG`(기본 20°)를 넘거나,
-contact force가 `CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로
-사라지면 각각 `stress_drop` / `contact_lost` 실패로 처리한다.
+외력 시험 중 위치·회전 변화는 실패 조건이 아니라
+`stress_pose_score` 감점에만 사용한다. Contact force가
+`CONTACT_LOST_DURATION_S`(기본 0.1 s) 이상 연속으로 사라질 때만
+`contact_lost`로 실패 처리한다. 외력 시험 종료 프레임에서 contact가 잠깐
+사라진 경우에도 즉시 성공/실패로 정하지 않고, contact가 복구되면 성공하고
+연속 상실 시간이 임계값에 도달하면 실패한다.
 실패는 `*.attempts.json`에만 남고 `output_grasp` 성공 데이터에는
 저장하지 않는다. 기존 output을 병합할 때도
 `merge_grasps.py` 기본값 `REQUIRE_COMPLETED = True`가 실패 record를 제외한다.

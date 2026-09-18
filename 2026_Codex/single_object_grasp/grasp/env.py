@@ -388,8 +388,6 @@ class RobotEnvCfg(DirectRLEnvCfg):
     enable_object_contact_sensor = True
     penetration_backend = "contact_sensor"
     pre_stress_object_motion_threshold = 0.1
-    max_relative_translation = 0.010
-    max_relative_rotation_deg = 20.0
     contact_lost_duration = 0.10
     contact_max_data_count_per_prim = 256
     override_gripper_collision_offsets = False
@@ -399,6 +397,9 @@ class RobotEnvCfg(DirectRLEnvCfg):
     root_max_angular_speed = math.radians(180.0)
     apply_finger_z_hop = False
     grasp_record_mode = "attempt"
+    draw_successful_grasps = False
+    debug_grasp_line_width = 5.0
+    debug_vector_length = 0.08
 
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 800.0,
@@ -443,6 +444,7 @@ class RobotEnv(DirectRLEnv):
         self.conf_data = conf_data
         self.debug = bool(debug)
         self.hold_completed = bool(hold_completed)
+        self._debug_draw = None
         super().__init__(cfg, **kwargs)
         self.replay_finished = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
@@ -502,8 +504,6 @@ class RobotEnv(DirectRLEnv):
             pre_stress_object_motion_threshold=(
                 cfg.pre_stress_object_motion_threshold
             ),
-            max_relative_translation=cfg.max_relative_translation,
-            max_relative_rotation_deg=cfg.max_relative_rotation_deg,
             contact_lost_duration=cfg.contact_lost_duration,
             apply_finger_z_hop=cfg.apply_finger_z_hop,
             grasp_record_mode=cfg.grasp_record_mode,
@@ -521,6 +521,12 @@ class RobotEnv(DirectRLEnv):
         self._pending_joint_target_env_ids = torch.empty(
             0, dtype=torch.long, device=self.device
         )
+        if self.debug and bool(cfg.draw_successful_grasps):
+            from isaacsim.util.debug_draw import _debug_draw
+
+            self._debug_draw = _debug_draw.acquire_debug_draw_interface()
+            self._debug_draw.clear_lines()
+            self._debug_draw.clear_points()
         if self.debug:
             details = ", ".join(
                 f"{name}({path}):rows={int(sensor._num_envs)},"
@@ -535,6 +541,73 @@ class RobotEnv(DirectRLEnv):
                 f"ContactSensors > envs={self.num_envs} "
                 f"aggregate={len(self.contact_sensors)} "
                 f"penetration={len(self.penetration_contact_sensors)} [{details}]",
+                flush=True,
+            )
+
+    def _draw_successful_grasps(self) -> None:
+        """Draw newly completed records at their replicated environment origins."""
+        if not self.policy.debug_success_records:
+            return
+        if self._debug_draw is None:
+            self.policy.debug_success_records.clear()
+            return
+        success_count = len(self.policy.debug_success_records)
+        starts: list[tuple[float, float, float]] = []
+        ends: list[tuple[float, float, float]] = []
+        colors: list[tuple[float, float, float, float]] = []
+        widths: list[float] = []
+        line_width = float(self.cfg.debug_grasp_line_width)
+        vector_length = float(self.cfg.debug_vector_length)
+        green = (0.1, 1.0, 0.15, 1.0)
+        blue = (0.0, 0.35, 1.0, 1.0)
+        magenta = (1.0, 0.0, 0.75, 1.0)
+
+        for env_id, record in self.policy.debug_success_records:
+            origin = self.scene.env_origins[env_id].detach().cpu().numpy()
+            boxes = record.get("grasp_boxes", [record.get("grasp_box", [])])
+            for box in boxes:
+                if len(box) != 4:
+                    continue
+                points = [
+                    tuple(float(value) for value in (point + origin))
+                    for point in torch.as_tensor(box, dtype=torch.float64).numpy()
+                ]
+                for first, second in ((0, 1), (1, 2), (2, 3), (3, 0)):
+                    starts.append(points[first])
+                    ends.append(points[second])
+                    colors.append(green)
+                    widths.append(line_width)
+
+            center = (
+                torch.as_tensor(
+                    record.get("target_points", [0.0, 0.0, 0.0]),
+                    dtype=torch.float64,
+                ).numpy()
+                + origin
+            )
+            for key, color in (("approach_vector", blue), ("normal", magenta)):
+                vector = torch.as_tensor(
+                    record.get(key, []), dtype=torch.float64
+                ).numpy()
+                if vector.shape != (3,):
+                    continue
+                norm = float((vector * vector).sum() ** 0.5)
+                if norm <= 1.0e-12:
+                    continue
+                vector = vector / norm
+                starts.append(tuple(float(value) for value in center))
+                ends.append(
+                    tuple(float(value) for value in center + vector * vector_length)
+                )
+                colors.append(color)
+                widths.append(line_width)
+
+        self.policy.debug_success_records.clear()
+        if starts:
+            self._debug_draw.draw_lines(starts, ends, colors, widths)
+            print(
+                f"GraspDebugDraw > added={success_count} "
+                f"lines={len(starts)} total_success={len(self.policy.output_list)}",
                 flush=True,
             )
 
@@ -949,6 +1022,7 @@ class RobotEnv(DirectRLEnv):
             contact_area=contact_area,
             applied_force=self.applied_force_n,
         )
+        self._draw_successful_grasps()
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         if self.hold_completed:
             # Interactive replay must keep the final simulated pose on screen.
@@ -1026,8 +1100,6 @@ class RobotEnv(DirectRLEnv):
             pre_stress_object_motion_threshold=(
                 self.cfg.pre_stress_object_motion_threshold
             ),
-            max_relative_translation=self.cfg.max_relative_translation,
-            max_relative_rotation_deg=self.cfg.max_relative_rotation_deg,
             contact_lost_duration=self.cfg.contact_lost_duration,
             apply_finger_z_hop=self.cfg.apply_finger_z_hop,
             grasp_record_mode=self.cfg.grasp_record_mode,

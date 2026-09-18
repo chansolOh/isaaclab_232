@@ -11,7 +11,7 @@ parser.add_argument(
     default="/nas/Dataset/Dataset_2026/dataset_v2",
     type=str,
 )
-parser.add_argument("--object_name", default="black_pepper_shaker", type=str)
+parser.add_argument("--object_name", default="car_leather_conditioner_bottle", type=str)
 parser.add_argument("--Gripper_name", default="Robotiq_2f140", type=str)
 parser.add_argument("--scene_start", default=0, type=int)
 
@@ -27,4 +27,5 @@ DRm.main(
     object_name=args.object_name,
     Gripper_name=args.Gripper_name,
     scene_num=args.scene_start,
+    root_path=args.root_path,
 )

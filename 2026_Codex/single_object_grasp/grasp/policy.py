@@ -124,8 +124,6 @@ class GraspPolicy:
         close_timeout: float = 1.5,
         stress_duration: float = 1.2,
         grasp_blocked_error: float = 0.003,
-        max_relative_translation: float = 0.010,
-        max_relative_rotation_deg: float = 20.0,
         min_contact_force: float = 0.12,
         contact_lost_duration: float = 0.10,
         contact_penetration_threshold: float = 0.005,
@@ -156,8 +154,6 @@ class GraspPolicy:
         self.close_timeout_steps = max(1, round(close_timeout / self.step_dt))
         self.stress_steps = max(1, round(stress_duration / self.step_dt))
         self.grasp_blocked_error = float(grasp_blocked_error)
-        self.max_relative_translation = float(max_relative_translation)
-        self.max_relative_rotation = math.radians(float(max_relative_rotation_deg))
         self.min_contact_force = float(min_contact_force)
         self.contact_lost_steps = max(
             1, round(float(contact_lost_duration) / self.step_dt)
@@ -182,6 +178,7 @@ class GraspPolicy:
             )
         self.output_list: list[dict] = []
         self.attempt_history: list[dict] = []
+        self.debug_success_records: list[tuple[int, dict]] = []
         self.total_grasp_num = len(pre_grasp_data)
         self.current_grasp_num = 0
 
@@ -211,6 +208,8 @@ class GraspPolicy:
         self.root_pose[:, 3] = 1.0
         self.start_pos = torch.zeros((e, 3), dtype=torch.float, **kwargs)
         self.end_pos = torch.zeros_like(self.start_pos)
+        self.approach_axis = torch.zeros_like(self.start_pos)
+        self.approach_axis[:, 2] = -1.0
         self.start_quat = torch.zeros((e, 4), dtype=torch.float, **kwargs)
         self.end_quat = torch.zeros_like(self.start_quat)
         self.transition_steps = torch.ones(e, dtype=torch.long, **kwargs)
@@ -262,6 +261,7 @@ class GraspPolicy:
 
     def _prepare_records(self) -> None:
         starts, ends, start_quat, end_quat = [], [], [], []
+        approach_axes = []
         start_joint, end_joint, transition, smooth = [], [], [], []
         for record in self.records:
             if record.get("target_object") != self.conf_data["objects"][0]["class"]:
@@ -278,6 +278,7 @@ class GraspPolicy:
                 ends.append(base["end"]["position"])
                 start_quat.append(base["start"]["orientation_wxyz"])
                 end_quat.append(base["end"]["orientation_wxyz"])
+                approach_axes.append([0.0, 0.0, -1.0])
                 start_joint.append(self._hand_joint_vector(record, "start"))
                 end_joint.append(self._hand_joint_vector(record, "end"))
                 setting = record.get("transition", {})
@@ -285,14 +286,40 @@ class GraspPolicy:
                 smooth.append(str(setting.get("interpolation", "smoothstep")).lower() == "smoothstep")
             else:
                 position = list(record["target_points"])
-                position[2] += self.total_length
                 orientation = list(record["target_orientation"])
                 orientation[0] += 180.0
                 quaternion = euler_angles_to_quat(orientation, degrees=True)
+                if record.get("use_3d_approach_axis", False):
+                    approach_axis = np.asarray(
+                        record.get("approach_vector", []), dtype=np.float64
+                    )
+                    if approach_axis.shape != (3,) or np.linalg.norm(
+                        approach_axis
+                    ) < 1.0e-9:
+                        roll, pitch, yaw = map(math.radians, orientation)
+                        approach_axis = np.asarray(
+                            [
+                                math.cos(yaw) * math.sin(pitch) * math.cos(roll)
+                                + math.sin(yaw) * math.sin(roll),
+                                math.sin(yaw) * math.sin(pitch) * math.cos(roll)
+                                - math.cos(yaw) * math.sin(roll),
+                                math.cos(pitch) * math.cos(roll),
+                            ],
+                            dtype=np.float64,
+                        )
+                    approach_axis /= np.linalg.norm(approach_axis)
+                    position = [
+                        position[axis] - approach_axis[axis] * self.total_length
+                        for axis in range(3)
+                    ]
+                else:
+                    approach_axis = [0.0, 0.0, -1.0]
+                    position[2] += self.total_length
                 starts.append(position)
                 ends.append(position)
                 start_quat.append(quaternion)
                 end_quat.append(quaternion)
+                approach_axes.append(list(approach_axis))
                 start_joint.append([0.0] * len(self.joint_names))
                 end_joint.append([0.0] * len(self.joint_names))
                 transition.append(1)
@@ -300,6 +327,7 @@ class GraspPolicy:
         tensor = lambda value, dtype=torch.float: torch.tensor(value, dtype=dtype, device=self.device)
         self.total_start_pos = tensor(starts)
         self.total_end_pos = tensor(ends)
+        self.total_approach_axis = tensor(approach_axes)
         self.total_start_quat = normalize_quaternion(tensor(np.asarray(start_quat)))
         self.total_end_quat = normalize_quaternion(tensor(np.asarray(end_quat)))
         self.total_start_joint = tensor(start_joint)
@@ -420,6 +448,7 @@ class GraspPolicy:
 
         self.start_pos[active] = self.total_start_pos[source]
         self.end_pos[active] = self.total_end_pos[source]
+        self.approach_axis[active] = self.total_approach_axis[source]
         self.start_quat[active] = self.total_start_quat[source]
         self.end_quat[active] = self.total_end_quat[source]
         self.transition_steps[active] = self.total_transition_steps[source]
@@ -456,8 +485,11 @@ class GraspPolicy:
         if len(approaching):
             progress = ((self.stage_step[approaching] + 1) / self.approach_steps).clamp(0.0, 1.0)
             smooth = progress * progress * (3.0 - 2.0 * progress)
-            self.root_pose[approaching, :3] = self.start_pos[approaching]
-            self.root_pose[approaching, 2] += self.approach_height * (1.0 - smooth)
+            self.root_pose[approaching, :3] = (
+                self.start_pos[approaching]
+                - self.approach_axis[approaching]
+                * (self.approach_height * (1.0 - smooth))[:, None]
+            )
             self.root_pose[approaching, 3:7] = self.start_quat[approaching]
             self.target_joint[approaching] = torch.lerp(
                 self.start_joint[approaching], self.open_joint[approaching], smooth[:, None]
@@ -495,8 +527,10 @@ class GraspPolicy:
                         len(closing), dtype=torch.float, device=self.device
                     )
                 self.applied_z_hop[closing] = z_hop
-                self.root_pose[closing, :3] = self.end_pos[closing]
-                self.root_pose[closing, 2] += z_hop
+                self.root_pose[closing, :3] = (
+                    self.end_pos[closing]
+                    - self.approach_axis[closing] * z_hop[:, None]
+                )
                 self.root_pose[closing, 3:7] = self.end_quat[closing]
             self.stage_step[closing] += 1
 
@@ -748,10 +782,6 @@ class GraspPolicy:
                 self.contact_lost_count[tested] + 1,
                 torch.zeros_like(self.contact_lost_count[tested]),
             )
-            drifted = (
-                (position_error > self.max_relative_translation)
-                | (rotation_error > self.max_relative_rotation)
-            )
             contact_lost = (
                 self.contact_lost_count[tested] >= self.contact_lost_steps
             )
@@ -760,14 +790,17 @@ class GraspPolicy:
                 progress = (self.stage_step[stress_envs].float() / self.stress_steps).clamp(0, 1)
                 self.stress_survival[stress_envs] = progress
                 failed_contact = stress_envs[contact_lost]
-                failed_drift = stress_envs[drifted & ~contact_lost]
+                # Pose drift is a quality score only. A grasp fails the stress
+                # test only after contact is continuously lost for the grace
+                # duration. If the final frame briefly loses contact, keep the
+                # test alive until contact recovers or the grace time expires.
+                contact_confirmed = self.contact_lost_count[stress_envs] == 0
                 completed = stress_envs[
-                    ~drifted
-                    & ~contact_lost
+                    ~contact_lost
+                    & contact_confirmed
                     & (self.stage_step[stress_envs] >= self.stress_steps)
                 ]
                 self._record(failed_contact, "contact_lost")
-                self._record(failed_drift, "stress_drop")
                 self.stress_survival[completed] = 1.0
                 self._record(completed, "completed")
 
@@ -1328,6 +1361,7 @@ class GraspPolicy:
             # only in attempt_history and must not become low-score grasps.
             if result == "completed":
                 self.output_list.append(record)
+                self.debug_success_records.append((env_id, record))
             self.attempt_history.append(
                 {
                     "source_pregrasp_index": source_id,

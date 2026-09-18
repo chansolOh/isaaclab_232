@@ -30,9 +30,11 @@ from merge_grasps import (
     grasp_boxes,
     load_json,
     mesh_in_box,
+    pregrasp_to_zero_pose,
     rotation_distance,
     save_npz,
     to_zero_pose,
+    zero_pose_object_config,
 )
 
 
@@ -42,7 +44,7 @@ from merge_grasps import (
 # -----------------------------------------------------------------------------
 ROOT = Path(
     "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/"
-    "black_pepper_shaker/Robotiq_2f140"
+    "black_pepper_shaker/UON_3finger_gripper"
 )
 SCENE_START: int | None = None
 SCENE_END: int | None = None
@@ -856,11 +858,43 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
                     raise ValueError(f"scene {scene_id}: single-object conf가 아닙니다.")
                 obj = objects[0]
                 reference_object = reference_object or obj
+                pregrasp_path = root / "pre_grasp" / f"{scene_id}.json"
+                if not pregrasp_path.is_file():
+                    raise FileNotFoundError(
+                        f"scene {scene_id}: replay용 pre_grasp가 없습니다: {pregrasp_path}"
+                    )
+                pregrasp_payload = load_json(pregrasp_path)
+                if isinstance(pregrasp_payload, dict):
+                    pregrasp_groups = [pregrasp_payload]
+                elif isinstance(pregrasp_payload, list):
+                    pregrasp_groups = pregrasp_payload
+                else:
+                    raise ValueError(f"scene {scene_id}: 잘못된 pre_grasp 형식")
+                if len(pregrasp_groups) != 1 or not isinstance(
+                    pregrasp_groups[0].get("data"), list
+                ):
+                    raise ValueError(
+                        f"scene {scene_id}: pre_grasp에는 gripper group 하나가 필요합니다."
+                    )
+                pregrasps = pregrasp_groups[0]["data"]
                 payload = load_json(root / grasp_dir_name / f"{scene_id}.json")
                 for local_index, item in enumerate(normalize_grasp_payload(payload)):
                     transformed = to_zero_pose(item, obj, scene_id)
                     if transformed is None:
                         continue
+                    if "source_pregrasp_index" not in item:
+                        raise KeyError(
+                            f"scene {scene_id} grasp {local_index}: source_pregrasp_index가 없습니다."
+                        )
+                    source_index = int(item["source_pregrasp_index"])
+                    if not 0 <= source_index < len(pregrasps):
+                        raise IndexError(
+                            f"scene {scene_id} grasp {local_index}: "
+                            f"source_pregrasp_index={source_index}, count={len(pregrasps)}"
+                        )
+                    transformed["replay_pregrasp"] = pregrasp_to_zero_pose(
+                        pregrasps[source_index], obj
+                    )
                     transformed["_filter_gui_id"] = f"{scene_id}:{local_index}"
                     transformed["_filter_gui_source_order"] = source_order
                     candidates.append(transformed)
@@ -1483,7 +1517,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         suffix = "" if not label else f"_{label}"
         default = (
             Path(self.root_edit.text())
-            / f"{self.object_name}_merged_grasp_reviewed{suffix}_zero_pose.json"
+            / f"{self.object_name}_merged_grasp_zero_pose.json"
         )
         selected, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -1506,6 +1540,10 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
                 "scene_ids": self.scene_ids,
                 "approach_axis_index": 2,
                 "approach_axis_sign": 1.0,
+                "object_config_zero_pose": zero_pose_object_config(
+                    self.reference_object
+                ),
+                "replay_schema_version": 1,
                 "filters": self._filter_settings(),
                 "manual_review": {
                     "accepted": decisions["accept"],
