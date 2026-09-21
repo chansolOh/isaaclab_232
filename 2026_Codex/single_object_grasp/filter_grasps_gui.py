@@ -40,12 +40,11 @@ from merge_grasps import (
 
 # -----------------------------------------------------------------------------
 # 실행 기본값: argparse 없이 여기 또는 GUI에서 변경한다.
-# ROOT는 <output-root>/<object>/<gripper> 폴더다.
+# ROOT는 물체 폴더들이 들어 있는 <output-root> 폴더다.
 # -----------------------------------------------------------------------------
-ROOT = Path(
-    "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/"
-    "black_pepper_shaker/UON_3finger_gripper"
-)
+ROOT = Path("/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen")
+DEFAULT_OBJECT = "black_pepper_shaker"
+DEFAULT_GRIPPER = "Robotiq_2f140"
 SCENE_START: int | None = None
 SCENE_END: int | None = None
 GRASP_DIR_NAME = "output_grasp"
@@ -57,6 +56,7 @@ DEFAULT_BOX_MARGIN_M = 0.002
 DEFAULT_MIN_OCCUPIED_BOXES = 1
 DEFAULT_NMS_CENTER_M = 0.015
 DEFAULT_NMS_ROTATION_DEG = 20.0
+DEFAULT_MAX_VISUALIZED_BBOXES = 10000
 AUTO_LOAD = True
 OPEN3D_WINDOW_WIDTH = 1100
 OPEN3D_WINDOW_HEIGHT = 850
@@ -502,16 +502,35 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         dataset_card, dataset_layout = self._card("Dataset")
         path_row = QtWidgets.QHBoxLayout()
         self.root_edit = QtWidgets.QLineEdit(str(ROOT))
-        self.root_edit.setPlaceholderText("<output-root>/<object>/<gripper>")
+        self.root_edit.setPlaceholderText("<output-root>")
+        self.root_edit.editingFinished.connect(self.refresh_dataset_choices)
         choose_btn = QtWidgets.QPushButton("폴더 선택")
         choose_btn.clicked.connect(self.choose_root)
+        refresh_btn = QtWidgets.QPushButton("목록 새로고침")
+        refresh_btn.clicked.connect(self.refresh_dataset_choices)
         load_btn = QtWidgets.QPushButton("데이터 불러오기")
         load_btn.setObjectName("PrimaryButton")
         load_btn.clicked.connect(self.load_dataset)
         path_row.addWidget(self.root_edit, 1)
         path_row.addWidget(choose_btn)
+        path_row.addWidget(refresh_btn)
         path_row.addWidget(load_btn)
         dataset_layout.addLayout(path_row)
+
+        selection_row = QtWidgets.QGridLayout()
+        selection_row.setHorizontalSpacing(10)
+        self.object_combo = QtWidgets.QComboBox()
+        self.object_combo.setMinimumContentsLength(24)
+        self.object_combo.currentIndexChanged.connect(self.refresh_gripper_choices)
+        self.gripper_combo = QtWidgets.QComboBox()
+        self.gripper_combo.setMinimumContentsLength(24)
+        selection_row.addWidget(QtWidgets.QLabel("물체 종류"), 0, 0)
+        selection_row.addWidget(self.object_combo, 0, 1)
+        selection_row.addWidget(QtWidgets.QLabel("그리퍼 종류"), 0, 2)
+        selection_row.addWidget(self.gripper_combo, 0, 3)
+        selection_row.setColumnStretch(1, 1)
+        selection_row.setColumnStretch(3, 1)
+        dataset_layout.addLayout(selection_row)
 
         settings_row = QtWidgets.QGridLayout()
         settings_row.setHorizontalSpacing(10)
@@ -538,6 +557,8 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         settings_row.setColumnStretch(8, 1)
         dataset_layout.addLayout(settings_row)
         root.addWidget(dataset_card)
+
+        self.refresh_dataset_choices(DEFAULT_OBJECT, DEFAULT_GRIPPER)
 
         # Tabs
         tabs = QtWidgets.QTabWidget()
@@ -691,7 +712,23 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             modes.addWidget(button)
         self.view_buttons["all"].setChecked(True)
         view_layout.addLayout(modes)
-        hint = QtWidgets.QLabel("전체 보기는 필터 통과 bbox를 한 번에 표시합니다.")
+
+        limit_row = QtWidgets.QHBoxLayout()
+        limit_row.addWidget(QtWidgets.QLabel("다중 보기 최대 bbox"))
+        self.max_visualized_bbox_spin = self._int_spin(
+            DEFAULT_MAX_VISUALIZED_BBOXES, 0, 10_000_000, 50
+        )
+        self.max_visualized_bbox_spin.setMaximumWidth(150)
+        self.max_visualized_bbox_spin.setSpecialValueText("제한 없음")
+        self.max_visualized_bbox_spin.valueChanged.connect(lambda _value: self.render())
+        limit_row.addWidget(self.max_visualized_bbox_spin)
+        limit_row.addStretch(1)
+        view_layout.addLayout(limit_row)
+
+        hint = QtWidgets.QLabel(
+            "필터 전체·승인·제외 보기에만 제한을 적용합니다. "
+            "현재 1개 보기는 해당 grasp의 bbox를 모두 표시합니다."
+        )
         hint.setObjectName("Muted")
         view_layout.addWidget(hint)
         layout.addWidget(view_box)
@@ -816,7 +853,95 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         )
         if selected:
             self.root_edit.setText(selected)
-            self.load_dataset()
+            self.refresh_dataset_choices()
+
+    @staticmethod
+    def _directory_names(root: Path) -> list[str]:
+        if not root.is_dir():
+            return []
+        return sorted(
+            (
+                path.name
+                for path in root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            ),
+            key=str.casefold,
+        )
+
+    @classmethod
+    def _object_directory_names(cls, root: Path) -> list[str]:
+        """Return folders that contain at least one grasp-dataset folder."""
+        return [
+            name
+            for name in cls._directory_names(root)
+            if any(
+                (child / "conf").is_dir() and (child / "pre_grasp").is_dir()
+                for child in (root / name).iterdir()
+                if child.is_dir()
+            )
+        ]
+
+    @classmethod
+    def _gripper_directory_names(cls, object_root: Path) -> list[str]:
+        return [
+            name
+            for name in cls._directory_names(object_root)
+            if (object_root / name / "conf").is_dir()
+            and (object_root / name / "pre_grasp").is_dir()
+        ]
+
+    @staticmethod
+    def _set_folder_choices(
+        combo: QtWidgets.QComboBox, names: list[str], preferred: str = ""
+    ) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        if preferred in names:
+            combo.setCurrentText(preferred)
+        combo.blockSignals(False)
+
+    def refresh_dataset_choices(
+        self, preferred_object: str = "", preferred_gripper: str = ""
+    ) -> None:
+        """Refresh object/gripper folders while preserving valid selections."""
+        if not isinstance(preferred_object, str):
+            preferred_object = ""
+        if not isinstance(preferred_gripper, str):
+            preferred_gripper = ""
+        root = Path(self.root_edit.text()).expanduser()
+        current_object = preferred_object or self.object_combo.currentText()
+        current_gripper = preferred_gripper or self.gripper_combo.currentText()
+        self._set_folder_choices(
+            self.object_combo, self._object_directory_names(root), current_object
+        )
+        self.refresh_gripper_choices(current_gripper)
+
+    def refresh_gripper_choices(self, preferred: str | int = "") -> None:
+        # currentIndexChanged supplies an integer; in that case preserve the
+        # currently selected gripper whenever it also exists for the new object.
+        preferred_name = "" if isinstance(preferred, int) else preferred
+        current_gripper = preferred_name or self.gripper_combo.currentText()
+        object_name = self.object_combo.currentText().strip()
+        object_root = Path(self.root_edit.text()).expanduser() / object_name
+        self._set_folder_choices(
+            self.gripper_combo,
+            self._gripper_directory_names(object_root),
+            current_gripper,
+        )
+
+    def _dataset_path(self) -> Path:
+        root = Path(self.root_edit.text()).expanduser().resolve()
+        object_name = self.object_combo.currentText().strip()
+        gripper_name = self.gripper_combo.currentText().strip()
+        if not object_name:
+            raise ValueError("물체 폴더를 선택하세요.")
+        if not gripper_name:
+            raise ValueError("그리퍼 폴더를 선택하세요.")
+        path = root / object_name / gripper_name
+        if not path.is_dir():
+            raise FileNotFoundError(f"데이터셋 폴더가 없습니다: {path}")
+        return path
 
     def _grasp_dir_name(self) -> str:
         value = self.grasp_dir_edit.text().strip()
@@ -838,7 +963,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
 
     def load_dataset(self) -> None:
         try:
-            root = Path(self.root_edit.text()).expanduser().resolve()
+            root = self._dataset_path()
             grasp_dir_name = self._grasp_dir_name()
             scene_ids = self._selected_scene_ids(root, grasp_dir_name)
             if not scene_ids:
@@ -969,6 +1094,9 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
                 "descending": bool(self.sort_descending_check.isChecked()),
             },
             "view_mode": self._current_view_mode(),
+            "visualization": {
+                "max_bbox_count": int(self.max_visualized_bbox_spin.value()),
+            },
         }
 
     def apply_filters(self) -> None:
@@ -1249,6 +1377,40 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         current = self.current_item()
         return [current] if current is not None else []
 
+    @staticmethod
+    def _bbox_count(items: list[dict]) -> int:
+        return sum(len(grasp_boxes(item)) for item in items)
+
+    def _visualization_items(self, current: dict | None) -> list[dict]:
+        """Limit multi-view geometry by bbox count without splitting a grasp."""
+        items = self._view_mode_items()
+        if self._current_view_mode() == "single":
+            return items
+        limit = int(self.max_visualized_bbox_spin.value())
+        if limit <= 0 or self._bbox_count(items) <= limit:
+            return items
+
+        current_id = review_id(current) if current is not None else None
+        current_item = next(
+            (item for item in items if review_id(item) == current_id), None
+        )
+        selected: list[dict] = []
+        used = 0
+        if current_item is not None:
+            # Keep the item being reviewed visible. It is never partially drawn,
+            # even when this single grasp itself exceeds the configured limit.
+            selected.append(current_item)
+            used = len(grasp_boxes(current_item))
+
+        for candidate in items:
+            if current_item is not None and review_id(candidate) == current_id:
+                continue
+            count = len(grasp_boxes(candidate))
+            if used + count <= limit:
+                selected.append(candidate)
+                used += count
+        return selected
+
     def _make_review_geometry(self, item: dict | None):
         points, lines, colors = [], [], []
         mode = self._current_view_mode()
@@ -1259,7 +1421,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             or (mode == "rejected" and current_decision == "reject")
         )
         if mode != "single":
-            candidates = self._view_mode_items()
+            candidates = self._visualization_items(item)
             for candidate in candidates:
                 if (
                     current_is_visible
@@ -1343,7 +1505,10 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             "accepted": "승인만",
             "rejected": "제외만",
         }.get(mode, mode)
-        drawn_count = len(self._view_mode_items())
+        all_view_items = self._view_mode_items()
+        drawn_items = self._visualization_items(item)
+        total_bbox_count = self._bbox_count(all_view_items)
+        drawn_bbox_count = self._bbox_count(drawn_items)
         if item is not None:
             decision = self.decisions.get(review_id(item), "")
             values = "   ".join(
@@ -1358,7 +1523,8 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             )
             decision_label = {"accept": "승인", "reject": "제외"}.get(decision, "미검수")
             self.item_label.setText(
-                f"{mode_label} · {drawn_count}개   |   "
+                f"{mode_label} · grasp {len(drawn_items)}/{len(all_view_items)}   ·   "
+                f"bbox {drawn_bbox_count}/{total_bbox_count}   |   "
                 f"[{self.current_index}/{len(self.visible) - 1}]   "
                 f"scene {item.get('scene_id')}   source {item.get('source_pregrasp_index', '?')}   "
                 f"상태 {decision_label}   ·   {alignment_text}\n{values}"
@@ -1388,16 +1554,17 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         grasp_dir = self._grasp_dir_name()
         label = grasp_dir.removeprefix("output_grasp").strip("_")
         suffix = "" if not label else f"_{label}"
-        return (
-            Path(self.root_edit.text())
-            / f"{self.object_name}_grasp_review{suffix}.json"
-        )
+        return self._dataset_path() / f"{self.object_name}_grasp_review{suffix}.json"
 
     def save_review_state(self) -> None:
         try:
             path = self._review_state_path()
+            dataset_path = self._dataset_path()
             payload = {
-                "root": str(Path(self.root_edit.text()).resolve()),
+                "root": str(dataset_path),
+                "dataset_root": str(Path(self.root_edit.text()).expanduser().resolve()),
+                "object_directory": self.object_combo.currentText(),
+                "gripper_directory": self.gripper_combo.currentText(),
                 "grasp_directory": self._grasp_dir_name(),
                 "object": self.object_name,
                 "scene_ids": self.scene_ids,
@@ -1422,7 +1589,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         try:
             payload = load_json(Path(selected))
             saved_root = Path(payload.get("root", "")).expanduser().resolve()
-            current_root = Path(self.root_edit.text()).expanduser().resolve()
+            current_root = self._dataset_path()
             if saved_root != current_root:
                 raise ValueError(
                     f"검수 상태의 root가 현재 데이터와 다릅니다.\n"
@@ -1489,6 +1656,11 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         mode = settings.get("view_mode")
         if mode in {"single", "all", "accepted", "rejected"}:
             self.set_view_mode(mode)
+        visualization = settings.get("visualization", {})
+        if isinstance(visualization, dict) and "max_bbox_count" in visualization:
+            self.max_visualized_bbox_spin.setValue(
+                int(visualization["max_bbox_count"])
+            )
 
     def final_items(self) -> list[dict]:
         result = []
@@ -1515,10 +1687,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         grasp_dir = self._grasp_dir_name()
         label = grasp_dir.removeprefix("output_grasp").strip("_")
         suffix = "" if not label else f"_{label}"
-        default = (
-            Path(self.root_edit.text())
-            / f"{self.object_name}_merged_grasp_zero_pose.json"
-        )
+        default = self._dataset_path() / f"{self.object_name}_merged_grasp_zero_pose.json"
         selected, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "최종 JSON 저장",
@@ -1535,7 +1704,10 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             decisions = Counter(self.decisions.get(review_id(item), "") for item in self.filtered)
             metadata = {
                 "object": self.object_name,
-                "gripper_root": str(Path(self.root_edit.text()).resolve()),
+                "dataset_root": str(Path(self.root_edit.text()).expanduser().resolve()),
+                "object_directory": self.object_combo.currentText(),
+                "gripper_directory": self.gripper_combo.currentText(),
+                "gripper_root": str(self._dataset_path()),
                 "source_grasp_directory": self._grasp_dir_name(),
                 "scene_ids": self.scene_ids,
                 "approach_axis_index": 2,

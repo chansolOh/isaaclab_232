@@ -258,6 +258,10 @@ def configure_gripper(cfg, gripper: dict, pre_grasps: list[dict]) -> None:
             )
         }
     )
+    # Stable logical channels used for per-finger contact-point recording.
+    # With the object-side sensor these bodies are PhysX filter columns; with
+    # the fallback layout each body has its own detailed ContactSensor.
+    cfg.contact_point_body_paths = contact_area_body_paths
     if not is_hand:
         cfg.scene.contact_sensor.prim_path = f"{cfg.robot_prim_path}/{paths[0]}"
         cfg.scene.contact_sensor.class_type = EnvGroupedContactSensor
@@ -390,6 +394,7 @@ class RobotEnvCfg(DirectRLEnvCfg):
     pre_stress_object_motion_threshold = 0.1
     contact_lost_duration = 0.10
     contact_max_data_count_per_prim = 256
+    contact_point_body_paths = []
     override_gripper_collision_offsets = False
     print_contact_separation = False
     contact_separation_print_delta = 0.0001
@@ -500,6 +505,7 @@ class RobotEnv(DirectRLEnv):
                 self.obj00.data.default_root_state[:, :3] + self.scene.env_origins
             ),
             object_initial_quat=self.obj00.data.default_root_state[:, 3:7],
+            contact_point_names=cfg.contact_point_body_paths,
             contact_penetration_threshold=cfg.contact_penetration_threshold,
             pre_stress_object_motion_threshold=(
                 cfg.pre_stress_object_motion_threshold
@@ -685,14 +691,29 @@ class RobotEnv(DirectRLEnv):
         return mapping
 
     def _contact_metrics(
-        self, *, emit_debug: bool = False, include_area: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return minimum separation and estimated contact-patch area per env."""
+        self,
+        *,
+        emit_debug: bool = False,
+        include_area: bool = False,
+        include_points: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return separation, area, and per-contact-body mean points."""
         minimum = torch.full(
             (self.num_envs,), torch.inf, dtype=torch.float, device=self.device
         )
         contact_area = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
+        )
+        channel_count = len(self.cfg.contact_point_body_paths)
+        contact_point_sums = torch.zeros(
+            (self.num_envs, channel_count, 3),
+            dtype=torch.float,
+            device=self.device,
+        )
+        contact_point_counts = torch.zeros(
+            (self.num_envs, channel_count),
+            dtype=torch.long,
+            device=self.device,
         )
         for sensor_index, (sensor, physical_row_to_env) in enumerate(zip(
             self.penetration_contact_sensors, self.contact_physical_row_to_env
@@ -729,6 +750,54 @@ class RobotEnv(DirectRLEnv):
                 0, env_ids, valid_separations, reduce="amin", include_self=True
             )
             minimum = torch.minimum(minimum, sensor_minimum)
+            sensor_name = self.cfg.penetration_contact_sensor_names[
+                sensor_index
+            ]
+            if include_points and channel_count:
+                valid_points = points.reshape(-1, 3).index_select(
+                    0, contact_indices
+                )
+                if sensor_name == "object_penetration_contact_sensor":
+                    filter_to_channel = torch.full(
+                        (filter_count,),
+                        -1,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    selected_filters = torch.as_tensor(
+                        self.cfg.contact_area_filter_indices,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    filter_to_channel[selected_filters] = torch.arange(
+                        len(selected_filters), dtype=torch.long, device=self.device
+                    )
+                    channel_ids = filter_to_channel[pair_ids % filter_count]
+                    selected = channel_ids >= 0
+                    point_env_ids = env_ids[selected]
+                    channel_ids = channel_ids[selected]
+                    selected_points = valid_points[selected]
+                else:
+                    sensor_path = self.cfg.penetration_contact_sensor_paths[
+                        sensor_index
+                    ]
+                    if sensor_path in self.cfg.contact_point_body_paths:
+                        channel = self.cfg.contact_point_body_paths.index(sensor_path)
+                        point_env_ids = env_ids
+                        channel_ids = torch.full_like(env_ids, channel)
+                        selected_points = valid_points
+                    else:
+                        point_env_ids = env_ids[:0]
+                        channel_ids = env_ids[:0]
+                        selected_points = valid_points[:0]
+                if len(point_env_ids):
+                    flat_ids = point_env_ids * channel_count + channel_ids
+                    contact_point_sums.view(-1, 3).index_add_(
+                        0, flat_ids, selected_points
+                    )
+                    contact_point_counts.view(-1).index_add_(
+                        0, flat_ids, torch.ones_like(flat_ids)
+                    )
             if include_area:
                 # PhysX reports points, not an exact triangle patch. One body
                 # pair may contain contacts on several object faces; grouping
@@ -780,9 +849,6 @@ class RobotEnv(DirectRLEnv):
                 covariance_sums.index_add_(0, point_group_ids, outer)
                 group_pair_ids = unique_group_keys // normal_code_count
                 area_groups = torch.where(group_counts >= 3)[0]
-                sensor_name = self.cfg.penetration_contact_sensor_names[
-                    sensor_index
-                ]
                 if sensor_name == "object_penetration_contact_sensor":
                     scoring_filters = torch.tensor(
                         self.cfg.contact_area_filter_indices,
@@ -849,7 +915,15 @@ class RobotEnv(DirectRLEnv):
                 self._printed_sensor_separation[sensor_index, update] = (
                     sensor_minimum[update]
                 )
-        return minimum, contact_area
+        contact_points_w = contact_point_sums / contact_point_counts.clamp_min(
+            1
+        )[:, :, None]
+        contact_points_w = torch.where(
+            contact_point_counts[:, :, None] > 0,
+            contact_points_w,
+            torch.nan,
+        )
+        return minimum, contact_area, contact_points_w, contact_point_counts
 
     def _minimum_contact_separation(
         self, *, emit_debug: bool = False
@@ -857,12 +931,18 @@ class RobotEnv(DirectRLEnv):
         return self._contact_metrics(emit_debug=emit_debug)[0]
 
     def _penetration_contact_metrics(
-        self, *, emit_debug: bool = False, include_area: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        *,
+        emit_debug: bool = False,
+        include_area: bool = False,
+        include_points: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Backend boundary for detailed gripper-object contact metrics."""
         if self.cfg.penetration_backend == "contact_sensor":
             return self._contact_metrics(
-                emit_debug=emit_debug, include_area=include_area
+                emit_debug=emit_debug,
+                include_area=include_area,
+                include_points=include_points,
             )
         raise RuntimeError(
             f"Unsupported penetration backend: {self.cfg.penetration_backend!r}"
@@ -1005,8 +1085,15 @@ class RobotEnv(DirectRLEnv):
                 & (self.policy.stage_num == CLOSE)
             ).item()
         )
-        current_separation, contact_area = self._penetration_contact_metrics(
-            emit_debug=True, include_area=measure_contact_area
+        (
+            current_separation,
+            contact_area,
+            contact_points_w,
+            contact_point_counts,
+        ) = self._penetration_contact_metrics(
+            emit_debug=True,
+            include_area=measure_contact_area,
+            include_points=measure_contact_area,
         )
         minimum_separation = torch.minimum(
             self._substep_minimum_contact_separation, current_separation
@@ -1020,6 +1107,8 @@ class RobotEnv(DirectRLEnv):
             contact_force=self._contact_force(),
             minimum_contact_separation=minimum_separation,
             contact_area=contact_area,
+            contact_points_w=contact_points_w,
+            contact_point_counts=contact_point_counts,
             applied_force=self.applied_force_n,
         )
         self._draw_successful_grasps()
@@ -1096,6 +1185,7 @@ class RobotEnv(DirectRLEnv):
                 self.obj00.data.default_root_state[:, :3] + self.scene.env_origins
             ),
             object_initial_quat=self.obj00.data.default_root_state[:, 3:7],
+            contact_point_names=self.cfg.contact_point_body_paths,
             contact_penetration_threshold=self.cfg.contact_penetration_threshold,
             pre_stress_object_motion_threshold=(
                 self.cfg.pre_stress_object_motion_threshold

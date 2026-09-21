@@ -119,6 +119,7 @@ class GraspPolicy:
         env_origin: torch.Tensor,
         object_initial_pos: torch.Tensor,
         object_initial_quat: torch.Tensor,
+        contact_point_names: list[str] | None = None,
         approach_height: float = 0.12,
         approach_duration: float = 0.8,
         close_timeout: float = 1.5,
@@ -149,6 +150,7 @@ class GraspPolicy:
         self.env_origin = env_origin
         self.object_initial_pos = object_initial_pos.clone()
         self.object_initial_quat = normalize_quaternion(object_initial_quat.clone())
+        self.contact_point_names = list(contact_point_names or [])
         self.approach_height = float(approach_height)
         self.approach_steps = max(1, round(approach_duration / self.step_dt))
         self.close_timeout_steps = max(1, round(close_timeout / self.step_dt))
@@ -256,6 +258,16 @@ class GraspPolicy:
         )
         self.stress_start_object_quat[:, 0] = 1.0
         self.grasp_contact_area = torch.zeros(e, dtype=torch.float, **kwargs)
+        contact_channel_count = len(self.contact_point_names)
+        self.grasp_contact_points_object_local = torch.full(
+            (e, contact_channel_count, 3),
+            torch.nan,
+            dtype=torch.float,
+            **kwargs,
+        )
+        self.grasp_contact_point_counts = torch.zeros(
+            (e, contact_channel_count), dtype=torch.long, **kwargs
+        )
         self.grasp_complete_joint = torch.zeros((e, j), dtype=torch.float, **kwargs)
         self.grasp_complete_width = torch.zeros(e, dtype=torch.float, **kwargs)
 
@@ -435,6 +447,8 @@ class GraspPolicy:
         self.stress_start_object_quat[active] = 0.0
         self.stress_start_object_quat[active, 0] = 1.0
         self.grasp_contact_area[active] = 0.0
+        self.grasp_contact_points_object_local[active] = torch.nan
+        self.grasp_contact_point_counts[active] = 0
         self.grasp_complete_joint[active] = 0.0
         self.grasp_complete_width[active] = 0.0
         self.applied_z_hop[active] = 0.0
@@ -562,6 +576,8 @@ class GraspPolicy:
         robot_pos: torch.Tensor,
         robot_quat: torch.Tensor,
         contact_area: torch.Tensor,
+        contact_points_w: torch.Tensor,
+        contact_point_counts: torch.Tensor,
     ) -> None:
         if not len(env_ids):
             return
@@ -583,6 +599,20 @@ class GraspPolicy:
         self.stress_center_error[env_ids] = 0.0
         self.stress_rotation_error[env_ids] = 0.0
         self.grasp_contact_area[env_ids] = contact_area[env_ids]
+        if self.grasp_contact_points_object_local.shape[1] > 0:
+            points_w = contact_points_w[env_ids]
+            counts = contact_point_counts[env_ids]
+            object_q = normalize_quaternion(object_quat[env_ids])[:, None, :]
+            object_q = object_q.expand(-1, points_w.shape[1], -1)
+            relative_w = points_w - object_pos[env_ids, None, :]
+            points_local = quaternion_rotate(
+                quaternion_conjugate(object_q), relative_w
+            )
+            valid = (counts > 0) & torch.all(torch.isfinite(points_w), dim=-1)
+            self.grasp_contact_points_object_local[env_ids] = torch.where(
+                valid[:, :, None], points_local, torch.nan
+            )
+            self.grasp_contact_point_counts[env_ids] = counts
         completed_joint = self.joint_pos[env_ids][:, self.joint_index]
         self.grasp_complete_joint[env_ids] = completed_joint
         if not self.is_hand:
@@ -649,6 +679,8 @@ class GraspPolicy:
         contact_force: torch.Tensor,
         minimum_contact_separation: torch.Tensor,
         contact_area: torch.Tensor,
+        contact_points_w: torch.Tensor,
+        contact_point_counts: torch.Tensor,
         applied_force: torch.Tensor,
     ) -> torch.Tensor:
         """Advance contact-dependent stages and return episode-done mask."""
@@ -754,6 +786,8 @@ class GraspPolicy:
                 robot_pos,
                 robot_quat,
                 contact_area,
+                contact_points_w,
+                contact_point_counts,
             )
             self._finish_without_record(closing[empty], "empty_close")
 
@@ -1024,18 +1058,132 @@ class GraspPolicy:
             "gripper_yaw_deg": float(grasp_rpy[2]),
         }
 
+    def _contact_point_records(self, env_id: int) -> list[dict]:
+        """Serialize the grasp-complete mean of each contact-body channel."""
+        points = (
+            self.grasp_contact_points_object_local[env_id]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        counts = self.grasp_contact_point_counts[env_id].detach().cpu().tolist()
+        return [
+            {
+                "sensor": name,
+                "position": point.round(7).tolist(),
+                "sample_count": int(count),
+            }
+            for name, point, count in zip(self.contact_point_names, points, counts)
+            if int(count) > 0 and np.all(np.isfinite(point))
+        ]
+
+    @staticmethod
+    def _apply_contact_height(
+        boxes: np.ndarray,
+        box: np.ndarray,
+        contact_points: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float | None]:
+        """Move bbox planes to mean contact Z without changing orientation."""
+        points = np.asarray(contact_points, dtype=np.float64).reshape(-1, 3)
+        points = points[np.all(np.isfinite(points), axis=1)]
+        if not len(points):
+            return boxes, box, None
+        mean_z = float(points[:, 2].mean())
+        adjusted_boxes = np.asarray(boxes, dtype=np.float64).copy()
+        adjusted_box = np.asarray(box, dtype=np.float64).copy()
+        # A restored grasp plane may be tilted. Flattening every vertex to one
+        # world-Z value destroys its normal and breaks bbox/approach alignment.
+        # Translate each representation as a rigid plane instead.
+        adjusted_boxes[:, :, 2] += mean_z - float(
+            adjusted_boxes[:, :, 2].mean()
+        )
+        adjusted_box[:, 2] += mean_z - float(adjusted_box[:, 2].mean())
+        return adjusted_boxes, adjusted_box, mean_z
+
+    @staticmethod
+    def _hand_descriptor_matrix(
+        matrix: np.ndarray,
+        boxes: np.ndarray,
+        approach: np.ndarray,
+    ) -> np.ndarray:
+        """Build a hand grasp frame whose +Z is normal to the saved bboxes."""
+        result = np.asarray(matrix, dtype=np.float64).copy()
+        z_axis = np.asarray(approach, dtype=np.float64)
+        z_axis /= max(float(np.linalg.norm(z_axis)), 1.0e-12)
+
+        # Hand BBoxes are generated in the world-aligned height-map TCP plane.
+        # Use one in-plane edge for X so yaw is retained while wrist pitch/roll
+        # cannot tilt the descriptor's approach axis away from the BBoxes.
+        x_axis = None
+        for candidate in np.asarray(boxes, dtype=np.float64):
+            for first, second in ((0, 1), (1, 2), (2, 3), (3, 0)):
+                edge = candidate[second] - candidate[first]
+                edge -= np.dot(edge, z_axis) * z_axis
+                norm = float(np.linalg.norm(edge))
+                if norm > 1.0e-9:
+                    x_axis = edge / norm
+                    break
+            if x_axis is not None:
+                break
+        if x_axis is None:
+            x_axis = result[:3, 0] - np.dot(result[:3, 0], z_axis) * z_axis
+            norm = float(np.linalg.norm(x_axis))
+            if norm <= 1.0e-9:
+                reference = np.asarray([1.0, 0.0, 0.0])
+                if abs(float(np.dot(reference, z_axis))) > 0.9:
+                    reference = np.asarray([0.0, 1.0, 0.0])
+                x_axis = reference - np.dot(reference, z_axis) * z_axis
+                norm = float(np.linalg.norm(x_axis))
+            x_axis /= max(norm, 1.0e-12)
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis /= max(float(np.linalg.norm(y_axis)), 1.0e-12)
+        x_axis = np.cross(y_axis, z_axis)
+        x_axis /= max(float(np.linalg.norm(x_axis)), 1.0e-12)
+        result[:3, :3] = np.column_stack((x_axis, y_axis, z_axis))
+        return result
+
     def _record_geometry(self, env_id: int, source: dict) -> dict:
         """Build either attempted or grasp-complete/object-restored geometry."""
         force_direction = (
             self.force_direction[env_id].detach().cpu().numpy().astype(np.float64)
         )
+        initial_object_pos = self.object_initial_pos[env_id] - self.env_origin[env_id]
+        initial_object_matrix = self._pose_matrix_np(
+            initial_object_pos, self.object_initial_quat[env_id]
+        )
+        contact_points_local = (
+            self.grasp_contact_points_object_local[env_id]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        valid_contact_points_local = contact_points_local[
+            np.all(np.isfinite(contact_points_local), axis=1)
+        ]
+        contact_points_record = self._transform_points_np(
+            initial_object_matrix, valid_contact_points_local
+        )
         if self.grasp_record_mode == "attempt":
             boxes = self._grasp_boxes(source)
             box = self._enclosing_grasp_box(source, boxes)
+            boxes, box, bbox_contact_mean_z = self._apply_contact_height(
+                boxes, box, contact_points_record
+            )
             matrix = self._pose_matrix_np(
                 torch.tensor(source["target_points"], device=self.device),
                 self.end_quat[env_id],
             )
+            if self.is_hand:
+                approach = (
+                    self.approach_axis[env_id]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+                matrix = self._hand_descriptor_matrix(matrix, boxes, approach)
             geometry = {
                 "grasp_boxes": boxes,
                 "grasp_box": box,
@@ -1044,6 +1192,8 @@ class GraspPolicy:
                 "target_width": float(source.get("target_width", 0.0)),
                 "force_direction": force_direction,
                 "restore_transform": np.eye(4, dtype=np.float64),
+                "contact_points_object_local": self._contact_point_records(env_id),
+                "bbox_contact_mean_z": bbox_contact_mean_z,
             }
             geometry.update(self._orientation_fields(matrix))
             # Preserve exact legacy Euler values in attempt mode.
@@ -1078,12 +1228,8 @@ class GraspPolicy:
         grasp_matrix_at_completion = robot_matrix.copy()
         grasp_matrix_at_completion[:3, 3] = grasp_center
 
-        initial_object_pos = self.object_initial_pos[env_id] - self.env_origin[env_id]
         complete_object_pos = (
             self.stress_start_object_pos[env_id] - self.env_origin[env_id]
-        )
-        initial_object_matrix = self._pose_matrix_np(
-            initial_object_pos, self.object_initial_quat[env_id]
         )
         complete_object_matrix = self._pose_matrix_np(
             complete_object_pos, self.stress_start_object_quat[env_id]
@@ -1092,6 +1238,23 @@ class GraspPolicy:
         restored_matrix = restore @ grasp_matrix_at_completion
         restored_boxes = self._transform_points_np(restore, boxes_at_completion)
         restored_box = self._transform_points_np(restore, box_at_completion)
+        restored_boxes, restored_box, bbox_contact_mean_z = (
+            self._apply_contact_height(
+                restored_boxes, restored_box, contact_points_record
+            )
+        )
+        if self.is_hand:
+            completed_approach = (
+                self.approach_axis[env_id]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            restored_approach = restore[:3, :3] @ completed_approach
+            restored_matrix = self._hand_descriptor_matrix(
+                restored_matrix, restored_boxes, restored_approach
+            )
         restored_force = restore[:3, :3] @ force_direction
         restored_force /= max(float(np.linalg.norm(restored_force)), 1.0e-12)
         geometry = {
@@ -1104,6 +1267,8 @@ class GraspPolicy:
             "restore_transform": restore,
             "initial_object_matrix": initial_object_matrix,
             "complete_object_matrix": complete_object_matrix,
+            "contact_points_object_local": self._contact_point_records(env_id),
+            "bbox_contact_mean_z": bbox_contact_mean_z,
         }
         geometry.update(self._orientation_fields(restored_matrix))
         return geometry
@@ -1245,6 +1410,9 @@ class GraspPolicy:
                 "source_pregrasp_index": source_id,
                 "gripper_model": self.gripper["gripper_name"],
                 "gripper_type": self.gripper["type"],
+                "contact_points_object_local": copy.deepcopy(
+                    geometry["contact_points_object_local"]
+                ),
                 "score": round(score, 6),
                 "rotation_score": round(rotation_score, 6),
                 "pose_score": round(pose_score, 6),
@@ -1287,6 +1455,18 @@ class GraspPolicy:
                     },
                     "contact_area_score_range_mm2": CONTACT_AREA_SCORE_RANGE_MM2,
                     "contact_area_estimator": "physx_manifold_footprint",
+                    "contact_point_estimator": (
+                        "mean_physx_manifold_point_per_contact_body"
+                    ),
+                    "contact_point_frame": "object_local",
+                    "contact_point_sensor_count": len(
+                        geometry["contact_points_object_local"]
+                    ),
+                    "bbox_height_source": (
+                        "mean_contact_point_z"
+                        if geometry["bbox_contact_mean_z"] is not None
+                        else "legacy_grasp_center_z_no_contact_points"
+                    ),
                     "grasp_contact_area_m2": round(
                         float(self.grasp_contact_area[env_id]), 9
                     ),
@@ -1383,6 +1563,9 @@ class GraspPolicy:
                     "contact_area_score": contact_area_score,
                     "grasp_contact_area_m2": float(
                         self.grasp_contact_area[env_id]
+                    ),
+                    "contact_points_object_local": copy.deepcopy(
+                        geometry["contact_points_object_local"]
                     ),
                     "pregrasp_pose_score": pregrasp_pose_score,
                     "stress_pose_score": stress_pose_score,

@@ -30,7 +30,7 @@ def main(
     FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
     HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-    ENVS = 200
+    ENVS = 250
     SEED = 42
     START_INDEX = 0
     MINIMUM_RECORDS = 2

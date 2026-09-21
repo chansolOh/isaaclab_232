@@ -8,11 +8,11 @@ import sys
 parser = argparse.ArgumentParser(description="Grasp Generator (finger + hand)")
 parser.add_argument(
     "--root_path",
-    default="/nas/Dataset/Dataset_2026/dataset_v2",
+    default="/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen",
     type=str,
 )
-parser.add_argument("--object_name", default="car_leather_conditioner_bottle", type=str)
-parser.add_argument("--Gripper_name", default="Robotiq_2f140", type=str)
+parser.add_argument("--object_name", default="black_pepper_shaker", type=str)
+parser.add_argument("--Gripper_name", default="Inspire-F1_right", type=str)
 parser.add_argument("--scene_start", default=0, type=int)
 
 args = parser.parse_args()
