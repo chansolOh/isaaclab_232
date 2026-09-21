@@ -30,7 +30,7 @@ def main(
     FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
     HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-    ENVS = 250
+    ENVS = 200
     SEED = 42
     START_INDEX = 0
     MINIMUM_RECORDS = 2
@@ -41,7 +41,7 @@ def main(
     DEBUG_VECTOR_LENGTH = 0.08
 
     # Physics는 SIM_DT 간격으로 진행하고 policy/action은 DECIMATION step마다 갱신한다.
-    SIM_DT = 1.0 / 800.0
+    SIM_DT = 1.0 / 700.0
     DECIMATION = 4
     ENABLE_CCD = True
     PHYSX_SOLVE_ARTICULATION_CONTACT_LAST = False
