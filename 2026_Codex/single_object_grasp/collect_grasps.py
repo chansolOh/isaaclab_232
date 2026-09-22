@@ -30,18 +30,18 @@ def main(
     FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
     HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-    ENVS = 200
+    ENVS = 2
     SEED = 42
     START_INDEX = 0
     MINIMUM_RECORDS = 2
     RETRIES = 0
-    OVERWRITE = False
-    DEBUG = False
+    OVERWRITE = True
+    DEBUG = True
     DEBUG_GRASP_LINE_WIDTH = 5.0
     DEBUG_VECTOR_LENGTH = 0.08
 
     # Physics는 SIM_DT 간격으로 진행하고 policy/action은 DECIMATION step마다 갱신한다.
-    SIM_DT = 1.0 / 700.0
+    SIM_DT = 1.0 / 800.0
     DECIMATION = 4
     ENABLE_CCD = True
     PHYSX_SOLVE_ARTICULATION_CONTACT_LAST = False
@@ -55,19 +55,25 @@ def main(
     # False면 기존 수집기처럼 gripper USD의 collider offset을 그대로 사용한다.
     OVERRIDE_GRIPPER_COLLISION_OFFSETS = True
     # 허용 관통 깊이(mm). 예: 1.0은 1 mm, 0.08은 0.08 mm이다.
-    CONTACT_PENETRATION_THRESHOLD_MM = 1
+    CONTACT_PENETRATION_THRESHOLD_MM = 30
     # object rigid body를 sensor source로 삼아 gripper 모든 link와의 접촉을
     # 단일 상세 센서에서 확인한다. False면 gripper-side 상세 센서로 되돌아간다.
     ENABLE_OBJECT_CONTACT_SENSOR = True
     # 추후 Warp 기반 검사로 교체할 때 policy/저장 형식은 유지하고 이 backend만
     # 교체할 수 있도록 penetration 판정 경계를 분리해 둔다.
     PENETRATION_BACKEND = "contact_sensor"
-    # APPROACH/CLOSE 중 물체가 초기 pose에서 이 이상 이동하면 transient
-    # contact report 유무와 관계없이 충돌 실패로 처리한다.
-    PRE_STRESS_OBJECT_MOTION_THRESHOLD = 0.1
+    # 참고 수집기처럼 파지 중 물체 이동은 점수로만 반영한다. True로
+    # 바꾸면 아래 임계값을 넘는 APPROACH/CLOSE 이동을 즉시 실패로 처리한다.
+    FAIL_ON_PRE_STRESS_OBJECT_MOTION = True
+    PRE_STRESS_OBJECT_MOTION_THRESHOLD = 0.12
     # 외력 시험 중 contact가 이 시간 이상 연속으로 사라질 때만 놓침 실패다.
     # 위치와 회전 변화는 score에만 반영하며 성공/실패 조건으로 사용하지 않는다.
     CONTACT_LOST_DURATION_S = 0.10
+    # Finger gripper는 접촉한 뒤 joint error 변화가 이 값 이하가 되면
+    # 닫힘이 멈춘 것으로 본다. 기본값 1회 확인이므로 첫 정지 step에서 완료된다.
+    CLOSE_STALL_DELTA = 2.0e-4
+    CLOSE_STALL_CONFIRM_STEPS = 1
+    CLOSE_MIN_WAIT_S = 0.0
     CONTACT_MAX_DATA_COUNT_PER_PRIM = 4096
     PRINT_CONTACT_SEPARATION = False
     CONTACT_SEPARATION_PRINT_DELTA_MM = 1.0
@@ -87,7 +93,7 @@ def main(
     # None이면 mode와 관계없이 output_grasp를 사용한다.
     OUTPUT_GRASP_FOLDER: str | None = None
 
-    HEADLESS = True
+    HEADLESS = False
     # "cuda:0" = GPU PhysX, "cpu" = CPU PhysX.
     # AppLauncher와 SimulationCfg 양쪽에 동일하게 적용된다.
     DEVICE = "cpu"
@@ -221,7 +227,13 @@ def main(
         cfg.pre_stress_object_motion_threshold = float(
             PRE_STRESS_OBJECT_MOTION_THRESHOLD
         )
+        cfg.fail_on_pre_stress_object_motion = bool(
+            FAIL_ON_PRE_STRESS_OBJECT_MOTION
+        )
         cfg.contact_lost_duration = float(CONTACT_LOST_DURATION_S)
+        cfg.close_stall_delta = float(CLOSE_STALL_DELTA)
+        cfg.close_stall_confirm_steps = int(CLOSE_STALL_CONFIRM_STEPS)
+        cfg.close_min_wait_s = float(CLOSE_MIN_WAIT_S)
         cfg.contact_max_data_count_per_prim = int(CONTACT_MAX_DATA_COUNT_PER_PRIM)
         cfg.print_contact_separation = bool(PRINT_CONTACT_SEPARATION)
         cfg.contact_separation_print_delta = (

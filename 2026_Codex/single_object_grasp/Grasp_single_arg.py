@@ -12,7 +12,7 @@ parser.add_argument(
     type=str,
 )
 parser.add_argument("--object_name", default="black_pepper_shaker", type=str)
-parser.add_argument("--Gripper_name", default="Inspire-F1_right", type=str)
+parser.add_argument("--Gripper_name", default="DH_Robotics_DH3", type=str)
 parser.add_argument("--scene_start", default=0, type=int)
 
 args = parser.parse_args()

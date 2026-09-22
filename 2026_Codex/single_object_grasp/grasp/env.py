@@ -392,7 +392,11 @@ class RobotEnvCfg(DirectRLEnvCfg):
     enable_object_contact_sensor = True
     penetration_backend = "contact_sensor"
     pre_stress_object_motion_threshold = 0.1
+    fail_on_pre_stress_object_motion = False
     contact_lost_duration = 0.10
+    close_stall_delta = 2.0e-4
+    close_stall_confirm_steps = 1
+    close_min_wait_s = 0.0
     contact_max_data_count_per_prim = 256
     contact_point_body_paths = []
     override_gripper_collision_offsets = False
@@ -510,9 +514,14 @@ class RobotEnv(DirectRLEnv):
             pre_stress_object_motion_threshold=(
                 cfg.pre_stress_object_motion_threshold
             ),
+            fail_on_pre_stress_object_motion=cfg.fail_on_pre_stress_object_motion,
             contact_lost_duration=cfg.contact_lost_duration,
+            close_stall_delta=cfg.close_stall_delta,
+            close_stall_confirm_steps=cfg.close_stall_confirm_steps,
+            close_min_wait_s=cfg.close_min_wait_s,
             apply_finger_z_hop=cfg.apply_finger_z_hop,
             grasp_record_mode=cfg.grasp_record_mode,
+            debug_failures=self.debug,
         )
         # Compatibility with the legacy main loop.
         self.act_pol = self.policy
@@ -1190,9 +1199,16 @@ class RobotEnv(DirectRLEnv):
             pre_stress_object_motion_threshold=(
                 self.cfg.pre_stress_object_motion_threshold
             ),
+            fail_on_pre_stress_object_motion=(
+                self.cfg.fail_on_pre_stress_object_motion
+            ),
             contact_lost_duration=self.cfg.contact_lost_duration,
+            close_stall_delta=self.cfg.close_stall_delta,
+            close_stall_confirm_steps=self.cfg.close_stall_confirm_steps,
+            close_min_wait_s=self.cfg.close_min_wait_s,
             apply_finger_z_hop=self.cfg.apply_finger_z_hop,
             grasp_record_mode=self.cfg.grasp_record_mode,
+            debug_failures=self.debug,
         )
         self.act_pol = self.policy
 

@@ -44,7 +44,7 @@ from merge_grasps import (
 # -----------------------------------------------------------------------------
 ROOT = Path("/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen")
 DEFAULT_OBJECT = "black_pepper_shaker"
-DEFAULT_GRIPPER = "Robotiq_2f140"
+DEFAULT_GRIPPER = "Inspire-F1_right"
 SCENE_START: int | None = None
 SCENE_END: int | None = None
 GRASP_DIR_NAME = "output_grasp"

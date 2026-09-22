@@ -125,12 +125,17 @@ class GraspPolicy:
         close_timeout: float = 1.5,
         stress_duration: float = 1.2,
         grasp_blocked_error: float = 0.003,
+        close_stall_delta: float = 2.0e-4,
+        close_stall_confirm_steps: int = 1,
+        close_min_wait_s: float = 0.0,
         min_contact_force: float = 0.12,
         contact_lost_duration: float = 0.10,
         contact_penetration_threshold: float = 0.005,
         pre_stress_object_motion_threshold: float = 0.005,
+        fail_on_pre_stress_object_motion: bool = False,
         apply_finger_z_hop: bool = False,
         grasp_record_mode: str = "attempt",
+        debug_failures: bool = False,
     ):
         if not pre_grasp_data:
             raise ValueError("pre_grasp_data is empty")
@@ -156,6 +161,15 @@ class GraspPolicy:
         self.close_timeout_steps = max(1, round(close_timeout / self.step_dt))
         self.stress_steps = max(1, round(stress_duration / self.step_dt))
         self.grasp_blocked_error = float(grasp_blocked_error)
+        self.close_stall_delta = float(close_stall_delta)
+        self.close_stall_confirm_steps = int(close_stall_confirm_steps)
+        self.close_min_wait_steps = max(
+            0, round(float(close_min_wait_s) / self.step_dt)
+        )
+        if self.close_stall_delta < 0.0:
+            raise ValueError("close_stall_delta must be non-negative")
+        if self.close_stall_confirm_steps < 1:
+            raise ValueError("close_stall_confirm_steps must be at least 1")
         self.min_contact_force = float(min_contact_force)
         self.contact_lost_steps = max(
             1, round(float(contact_lost_duration) / self.step_dt)
@@ -170,7 +184,11 @@ class GraspPolicy:
             raise ValueError(
                 "pre_stress_object_motion_threshold must be non-negative"
             )
+        self.fail_on_pre_stress_object_motion = bool(
+            fail_on_pre_stress_object_motion
+        )
         self.apply_finger_z_hop = bool(apply_finger_z_hop)
+        self.debug_failures = bool(debug_failures)
         self.grasp_record_mode = str(grasp_record_mode).strip().lower()
         valid_record_modes = {"attempt", "grasp_complete_restored"}
         if self.grasp_record_mode not in valid_record_modes:
@@ -201,6 +219,10 @@ class GraspPolicy:
         self.assigned_pregrasp = torch.full((e,), -1, dtype=torch.long, **kwargs)
         self.recorded = torch.zeros(e, dtype=torch.bool, **kwargs)
         self.failed_reason = [""] * e
+        self.current_object_displacement = torch.zeros((e, 3), dtype=torch.float, **kwargs)
+        self.last_contact_point_counts = torch.zeros(
+            (e, len(self.contact_point_names)), dtype=torch.long, **kwargs
+        )
         self.target_joint = torch.zeros((e, j), dtype=torch.float, **kwargs)
         self.open_joint = torch.zeros_like(self.target_joint)
         self.close_joint = torch.zeros_like(self.target_joint)
@@ -439,6 +461,8 @@ class GraspPolicy:
         self.minimum_contact_separation[active] = torch.inf
         self.minimum_close_contact_separation[active] = torch.inf
         self.maximum_pre_stress_object_motion[active] = 0.0
+        self.current_object_displacement[active] = 0.0
+        self.last_contact_point_counts[active] = 0
         self.pregrasp_rotation_error[active] = 0.0
         self.stress_rotation_error[active] = 0.0
         self.pregrasp_center_error[active] = 0.0
@@ -628,9 +652,50 @@ class GraspPolicy:
         self.stage_step[env_ids] = 0
         self.contact_lost_count[env_ids] = 0
 
+    def _print_failure(self, env_id: int, reason: str) -> None:
+        """Print one compact, environment-specific failure diagnostic."""
+        if not self.debug_failures:
+            return
+        stage = int(self.stage_num[env_id])
+        stage_name = {
+            APPROACH: "APPROACH",
+            CLOSE: "CLOSE",
+            STRESS: "STRESS",
+            DONE: "DONE",
+            DISABLED: "DISABLED",
+        }.get(stage, str(stage))
+        displacement = self.current_object_displacement[env_id].detach().cpu().tolist()
+        current_counts = (
+            self.last_contact_point_counts[env_id].detach().cpu().tolist()
+        )
+        grasp_counts = (
+            self.grasp_contact_point_counts[env_id].detach().cpu().tolist()
+        )
+        separation = self._minimum_separation_value(env_id)
+        close_separation = self._minimum_close_separation_value(env_id)
+        print(
+            "GraspFailure > "
+            f"env={env_id} "
+            f"source={int(self.assigned_pregrasp[env_id])} "
+            f"reason={reason} stage={stage_name} "
+            f"step={int(self.stage_step[env_id])} "
+            f"contact_force={float(self.last_contact_force[env_id]):.4f}N "
+            f"current_contact_counts={current_counts} "
+            f"grasp_contact_counts={grasp_counts} "
+            f"object_delta=({displacement[0]:+.5f},"
+            f"{displacement[1]:+.5f},{displacement[2]:+.5f})m "
+            f"object_motion={float(self.maximum_pre_stress_object_motion[env_id]):.5f}m "
+            f"separation={separation}m close_separation={close_separation}m "
+            f"penetration={self._penetration_mm(separation)}mm "
+            f"relative_translation={float(self.relative_translation_error[env_id]):.5f}m "
+            f"relative_rotation={math.degrees(float(self.relative_rotation_error[env_id])):.2f}deg",
+            flush=True,
+        )
+
     def _finish_without_record(self, env_ids: torch.Tensor, reason: str) -> None:
         env_ids = env_ids[~self.recorded[env_ids]]
         for env_id in env_ids.tolist():
+            self._print_failure(env_id, reason)
             self.failed_reason[env_id] = reason
             self.attempt_history.append(
                 {
@@ -660,6 +725,9 @@ class GraspPolicy:
                     "maximum_pre_stress_object_motion_m": round(
                         float(self.maximum_pre_stress_object_motion[env_id]), 7
                     ),
+                    "pre_stress_object_motion_failure_enabled": (
+                        self.fail_on_pre_stress_object_motion
+                    ),
                     "finger_z_hop_m": round(float(self.applied_z_hop[env_id]), 7),
                     "finger_z_hop_enabled": self.apply_finger_z_hop,
                 }
@@ -686,6 +754,9 @@ class GraspPolicy:
         """Advance contact-dependent stages and return episode-done mask."""
         self.joint_pos = joint_pos
         self.last_contact_force = contact_force
+        self.current_object_displacement = object_pos - self.object_initial_pos
+        if self.last_contact_point_counts.shape == contact_point_counts.shape:
+            self.last_contact_point_counts = contact_point_counts.clone()
         self.max_test_force = torch.maximum(self.max_test_force, applied_force)
         finite_separation = torch.isfinite(minimum_contact_separation)
         closing_separation = (
@@ -727,20 +798,21 @@ class GraspPolicy:
             & ((self.stage_num == APPROACH) | (self.stage_num == CLOSE))
         )
         object_motion = torch.linalg.vector_norm(
-            object_pos - self.object_initial_pos, dim=1
+            self.current_object_displacement, dim=1
         )
         self.maximum_pre_stress_object_motion = torch.where(
             pre_stress,
             torch.maximum(self.maximum_pre_stress_object_motion, object_motion),
             self.maximum_pre_stress_object_motion,
         )
-        moved_before_stress = torch.where(
-            pre_stress
-            & (object_motion > self.pre_stress_object_motion_threshold)
-        )[0]
-        self._finish_without_record(
-            moved_before_stress, "pre_stress_object_motion"
-        )
+        if self.fail_on_pre_stress_object_motion:
+            moved_before_stress = torch.where(
+                pre_stress
+                & (object_motion > self.pre_stress_object_motion_threshold)
+            )[0]
+            self._finish_without_record(
+                moved_before_stress, "pre_stress_object_motion"
+            )
         closing = torch.where((self.action_enable == 1) & (self.stage_num == CLOSE))[0]
         if len(closing):
             current = joint_pos[closing][:, self.joint_index]
@@ -758,9 +830,9 @@ class GraspPolicy:
                 empty = torch.zeros_like(ready)
             else:
                 delta = torch.abs(error - self.close_error_previous[closing])
-                stalled = self.close_error_valid[closing] & (delta < 2.0e-4) & (
-                    error > self.grasp_blocked_error
-                )
+                stalled = self.close_error_valid[closing] & (
+                    delta <= self.close_stall_delta
+                ) & (error > self.grasp_blocked_error)
                 self.close_stall_count[closing] = torch.where(
                     stalled,
                     self.close_stall_count[closing] + 1,
@@ -768,12 +840,20 @@ class GraspPolicy:
                 )
                 self.close_error_previous[closing] = error
                 self.close_error_valid[closing] = True
-                waited = self.stage_step[closing] >= max(5, int(0.08 / self.step_dt))
+                waited = self.stage_step[closing] >= self.close_min_wait_steps
                 timed_out = self.stage_step[closing] >= self.close_timeout_steps
                 blocked = error > self.grasp_blocked_error
+                # Match the legacy collector: this is an environment-wide
+                # any-contact check, not an all-fingers/contact-point-count
+                # requirement. A three-finger gripper may legitimately grasp
+                # with only two active fingertip contact channels.
                 contact_confirmed = self.close_contact_seen[closing]
                 grasped = waited & blocked & contact_confirmed & (
-                    (self.close_stall_count[closing] >= 4) | timed_out
+                    (
+                        self.close_stall_count[closing]
+                        >= self.close_stall_confirm_steps
+                    )
+                    | timed_out
                 )
                 # A mimic/limited articulation can stall a few milliradians
                 # before its target even with no object present.  Joint error
@@ -1291,6 +1371,8 @@ class GraspPolicy:
         for env_id in env_ids.tolist():
             if self.recorded[env_id]:
                 continue
+            if result != "completed":
+                self._print_failure(env_id, result)
             source_id = int(self.assigned_pregrasp[env_id])
             source = self.records[source_id]
             pregrasp_rotation_score = min(
@@ -1606,6 +1688,9 @@ class GraspPolicy:
                     ),
                     "maximum_pre_stress_object_motion_m": float(
                         self.maximum_pre_stress_object_motion[env_id]
+                    ),
+                    "pre_stress_object_motion_failure_enabled": (
+                        self.fail_on_pre_stress_object_motion
                     ),
                     "finger_z_hop_m": float(self.applied_z_hop[env_id]),
                     "finger_z_hop_enabled": self.apply_finger_z_hop,
