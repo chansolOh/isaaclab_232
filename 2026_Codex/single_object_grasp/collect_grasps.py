@@ -30,13 +30,13 @@ def main(
     FINGER_INFO = Path("/nas/ochansol/gripper_info/gripper_info_new_2026.json")
     HAND_INFO = Path("/nas/ochansol/gripper_info/gripper_info_hand_2026.json")
 
-    ENVS = 2
+    ENVS = 150
     SEED = 42
     START_INDEX = 0
     MINIMUM_RECORDS = 2
     RETRIES = 0
-    OVERWRITE = True
-    DEBUG = True
+    OVERWRITE = False
+    DEBUG = False
     DEBUG_GRASP_LINE_WIDTH = 5.0
     DEBUG_VECTOR_LENGTH = 0.08
 
@@ -55,7 +55,7 @@ def main(
     # False면 기존 수집기처럼 gripper USD의 collider offset을 그대로 사용한다.
     OVERRIDE_GRIPPER_COLLISION_OFFSETS = True
     # 허용 관통 깊이(mm). 예: 1.0은 1 mm, 0.08은 0.08 mm이다.
-    CONTACT_PENETRATION_THRESHOLD_MM = 30
+    CONTACT_PENETRATION_THRESHOLD_MM = 10
     # object rigid body를 sensor source로 삼아 gripper 모든 link와의 접촉을
     # 단일 상세 센서에서 확인한다. False면 gripper-side 상세 센서로 되돌아간다.
     ENABLE_OBJECT_CONTACT_SENSOR = True
@@ -93,7 +93,7 @@ def main(
     # None이면 mode와 관계없이 output_grasp를 사용한다.
     OUTPUT_GRASP_FOLDER: str | None = None
 
-    HEADLESS = False
+    HEADLESS = True
     # "cuda:0" = GPU PhysX, "cpu" = CPU PhysX.
     # AppLauncher와 SimulationCfg 양쪽에 동일하게 적용된다.
     DEVICE = "cpu"
