@@ -11,6 +11,11 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import signal
+import subprocess
+import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -32,7 +37,6 @@ from merge_grasps import (
     mesh_in_box,
     pregrasp_to_zero_pose,
     rotation_distance,
-    save_npz,
     to_zero_pose,
     zero_pose_object_config,
 )
@@ -111,6 +115,109 @@ def clean_item(item: dict) -> dict:
     result.pop("_filter_gui_id", None)
     result.pop("_filter_gui_source_order", None)
     return result
+
+
+def compact_merged_item(item: dict) -> dict:
+    """Keep only replay, visualization, score, and source lookup fields."""
+    required = (
+        "scene_id",
+        "source_pregrasp_index",
+        "grasp_box",
+        "grasp_boxes",
+        "grasp_mat",
+        "approach_vector",
+        "target_points",
+        "target_orientation",
+        "target_width",
+        "score",
+        "normal",
+    )
+    missing = [key for key in required if key not in item]
+    if missing:
+        raise KeyError(f"최종 병합 항목에 필수 필드가 없습니다: {missing}")
+    result = {key: copy.deepcopy(item[key]) for key in required}
+
+    # Finger grasps can be replayed directly from the common target fields.
+    # Hands additionally need their named preset trajectory and joint targets.
+    # Use the output grasp fields, not replay_pregrasp: in
+    # grasp_complete_restored mode target_base_tf carries the same object-motion
+    # restore as grasp_boxes/grasp_mat.  replay_pregrasp is intentionally kept
+    # only as source/debug metadata while reviewing.
+    if str(item.get("gripper_type", "")).lower() == "hand":
+        preset_fields = (
+            "preset_name",
+            "target_base_tf",
+            "target_joint_pos",
+            "joint_unit",
+            "transition",
+        )
+        preset = {
+            key: copy.deepcopy(item[key])
+            for key in preset_fields
+            if key in item
+        }
+        if "target_base_tf" not in preset or "target_joint_pos" not in preset:
+            raise KeyError("Hand 병합 항목에 재현용 base/joint preset이 없습니다")
+        result["preset"] = preset
+    return result
+
+
+def save_compact_npz(path: Path, metadata: dict, items: list[dict]) -> None:
+    """Save the compact merged schema without diagnostic/derived score arrays."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    boxes = np.asarray([item["grasp_box"] for item in items], dtype=np.float32).reshape(
+        -1, 4, 3
+    )
+    box_groups = [
+        np.asarray(item["grasp_boxes"], dtype=np.float32).reshape(-1, 4, 3)
+        for item in items
+    ]
+    box_offsets = np.zeros(len(box_groups) + 1, dtype=np.int64)
+    box_offsets[1:] = np.cumsum([len(group) for group in box_groups])
+    boxes_flat = (
+        np.concatenate(box_groups, axis=0)
+        if box_groups
+        else np.zeros((0, 4, 3), dtype=np.float32)
+    )
+    temporary = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.npz")
+    np.savez_compressed(
+        temporary,
+        metadata_json=np.asarray(json.dumps(metadata, separators=(",", ":"))),
+        scene_id=np.asarray([item["scene_id"] for item in items]),
+        source_pregrasp_index=np.asarray(
+            [item["source_pregrasp_index"] for item in items], dtype=np.int64
+        ),
+        grasp_box=boxes,
+        grasp_boxes_flat=boxes_flat,
+        grasp_boxes_offsets=box_offsets,
+        grasp_mat=np.asarray(
+            [item["grasp_mat"] for item in items], dtype=np.float32
+        ).reshape(-1, 4, 4),
+        approach_vector=np.asarray(
+            [item["approach_vector"] for item in items], dtype=np.float32
+        ).reshape(-1, 3),
+        target_points=np.asarray(
+            [item["target_points"] for item in items], dtype=np.float32
+        ).reshape(-1, 3),
+        target_orientation=np.asarray(
+            [item["target_orientation"] for item in items], dtype=np.float32
+        ).reshape(-1, 3),
+        target_width=np.asarray(
+            [item["target_width"] for item in items], dtype=np.float32
+        ),
+        score=np.asarray([item["score"] for item in items], dtype=np.float32),
+        normal=np.asarray(
+            [item["normal"] for item in items], dtype=np.float32
+        ).reshape(-1, 3),
+        preset_json=np.asarray(
+            [
+                json.dumps(item.get("preset"), separators=(",", ":"))
+                if "preset" in item else ""
+                for item in items
+            ]
+        ),
+    )
+    os.replace(temporary, path)
 
 
 def item_center(item: dict) -> np.ndarray:
@@ -427,12 +534,18 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         self.mesh_tree: cKDTree | None = None
         self.object_name = "object"
         self.last_filter_counts: dict[str, int] = {}
+        self.last_filter_used_pre_nms_cache = False
+        self._pre_nms_cache_key: str | None = None
+        self._pre_nms_cache_items: list[dict] = []
+        self._pre_nms_cache_counts: dict[str, int] = {}
         self.loaded_root: Path | None = None
         self.loaded_grasp_dir_name: str | None = None
+        self.loaded_dataset_signature: tuple | None = None
         self.visualizer = None
         self.object_mesh = None
         self.grasp_lines = None
         self.target_cloud = None
+        self.isaac_replay_process: subprocess.Popen | None = None
 
         self.score_checks: dict[str, QtWidgets.QCheckBox] = {}
         self.score_spins: dict[str, QtWidgets.QDoubleSpinBox] = {}
@@ -777,13 +890,24 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         layout.addWidget(nav_box)
 
         session_box = QtWidgets.QGroupBox("검수 상태")
-        session_layout = QtWidgets.QHBoxLayout(session_box)
+        session_layout = QtWidgets.QGridLayout(session_box)
         save_state_btn = QtWidgets.QPushButton("상태 저장")
         save_state_btn.clicked.connect(self.save_review_state)
         load_state_btn = QtWidgets.QPushButton("상태 불러오기")
         load_state_btn.clicked.connect(self.load_review_state)
-        session_layout.addWidget(save_state_btn)
-        session_layout.addWidget(load_state_btn)
+        export_isaac_btn = QtWidgets.QPushButton("필터 결과 Replay 시작 / 갱신")
+        export_isaac_btn.setObjectName("PrimaryButton")
+        export_isaac_btn.clicked.connect(self.start_isaac_replay)
+        stop_isaac_btn = QtWidgets.QPushButton("Replay 종료")
+        stop_isaac_btn.setObjectName("DangerButton")
+        stop_isaac_btn.clicked.connect(lambda: self.stop_isaac_replay())
+        import_isaac_btn = QtWidgets.QPushButton("Isaac 검수 결과 불러오기")
+        import_isaac_btn.clicked.connect(self.load_isaac_review_result)
+        session_layout.addWidget(save_state_btn, 0, 0)
+        session_layout.addWidget(load_state_btn, 0, 1)
+        session_layout.addWidget(export_isaac_btn, 1, 0)
+        session_layout.addWidget(stop_isaac_btn, 1, 1)
+        session_layout.addWidget(import_isaac_btn, 2, 0, 1, 2)
         layout.addWidget(session_box)
 
         export_box = QtWidgets.QGroupBox("최종 저장")
@@ -961,7 +1085,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             scene_ids = [value for value in scene_ids if int(value) <= end]
         return scene_ids
 
-    def load_dataset(self) -> None:
+    def load_dataset(self) -> bool:
         try:
             root = self._dataset_path()
             grasp_dir_name = self._grasp_dir_name()
@@ -1038,6 +1162,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             )
 
             self.candidates = candidates
+            self._invalidate_pre_nms_cache()
             if (
                 self.loaded_root is not None
                 and (self.loaded_root != root or self.loaded_grasp_dir_name != grasp_dir_name)
@@ -1045,6 +1170,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
                 self.decisions = {}
             self.loaded_root = root
             self.loaded_grasp_dir_name = grasp_dir_name
+            self.loaded_dataset_signature = self._dataset_load_signature()
             self.reference_object = reference_object
             self.scene_ids = scene_ids
             self.mesh_vertices = vertices
@@ -1057,9 +1183,21 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
                 f"로드 완료  ·  {len(scene_ids)} scenes  ·  {len(candidates)} grasps  ·  mesh {obj_path.name}"
             )
             self.apply_filters()
+            return True
         except Exception as exc:
             self._set_status(f"로드 실패: {exc}")
             QtWidgets.QMessageBox.critical(self, "Load failed", str(exc))
+            return False
+
+    def _dataset_load_signature(self) -> tuple:
+        """Values that require reloading source files or object geometry."""
+        return (
+            str(self._dataset_path()),
+            self._grasp_dir_name(),
+            self.scene_start_edit.text().strip(),
+            self.scene_end_edit.text().strip(),
+            round(float(self.mesh_scale_spin.value()), 9),
+        )
 
     # --------------------------------------------------------------- filtering
     def _current_view_mode(self) -> str:
@@ -1099,50 +1237,82 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             },
         }
 
+    def _invalidate_pre_nms_cache(self) -> None:
+        self._pre_nms_cache_key = None
+        self._pre_nms_cache_items = []
+        self._pre_nms_cache_counts = {}
+        self.last_filter_used_pre_nms_cache = False
+
+    @staticmethod
+    def _pre_nms_settings_key(settings: dict) -> str:
+        """Return a stable key for every filter stage before NMS."""
+        pre_nms = {
+            "mesh_unit_scale": settings["mesh_unit_scale"],
+            "require_completed": settings["require_completed"],
+            "score_thresholds": settings["score_thresholds"],
+            "empty_box": settings["empty_box"],
+        }
+        return json.dumps(pre_nms, sort_keys=True, separators=(",", ":"))
+
+    def _filter_before_nms(self, settings: dict) -> tuple[list[dict], dict[str, int]]:
+        """Run completed/score/empty filters from immutable loaded candidates."""
+        items = list(self.candidates)
+        counts = {"loaded": len(items)}
+
+        if settings["require_completed"]:
+            items = [
+                item
+                for item in items
+                if isinstance(item.get("quality"), dict)
+                and item["quality"].get("result") == "completed"
+            ]
+        counts["completed"] = len(items)
+
+        for key, threshold in settings["score_thresholds"].items():
+            items = [item for item in items if finite_score(item, key) >= threshold]
+            counts[f"after_{key}"] = len(items)
+
+        empty = settings["empty_box"]
+        if empty["enabled"]:
+            thickness = max(0.0, empty["thickness_m"])
+            margin = max(0.0, empty["margin_m"])
+            required = max(1, empty["min_occupied_boxes"])
+            self._set_status(f"Empty bbox 검사 중  ·  {len(items)}개")
+            if self.mesh_tree is None:
+                raise RuntimeError("Mesh 공간 인덱스가 준비되지 않았습니다.")
+            items = [
+                item
+                for item in items
+                if occupied_box_count(
+                    item,
+                    self.mesh_vertices,
+                    self.mesh_tree,
+                    thickness,
+                    margin,
+                )
+                >= required
+            ]
+        counts["after_empty_box"] = len(items)
+        return items, counts
+
     def apply_filters(self) -> None:
         if not self.candidates:
             self.filtered = []
+            self._invalidate_pre_nms_cache()
             self.refresh_visible()
             return
         try:
             settings = self._filter_settings()
-            items = list(self.candidates)
-            counts = {"loaded": len(items)}
-
-            if settings["require_completed"]:
-                items = [
-                    item
-                    for item in items
-                    if isinstance(item.get("quality"), dict)
-                    and item["quality"].get("result") == "completed"
-                ]
-            counts["completed"] = len(items)
-
-            for key, threshold in settings["score_thresholds"].items():
-                items = [item for item in items if finite_score(item, key) >= threshold]
-                counts[f"after_{key}"] = len(items)
-
-            empty = settings["empty_box"]
-            if empty["enabled"]:
-                thickness = max(0.0, empty["thickness_m"])
-                margin = max(0.0, empty["margin_m"])
-                required = max(1, empty["min_occupied_boxes"])
-                self._set_status(f"Empty bbox 검사 중  ·  {len(items)}개")
-                kept = []
-                if self.mesh_tree is None:
-                    raise RuntimeError("Mesh 공간 인덱스가 준비되지 않았습니다.")
-                for item in items:
-                    occupied = occupied_box_count(
-                        item,
-                        self.mesh_vertices,
-                        self.mesh_tree,
-                        thickness,
-                        margin,
-                    )
-                    if occupied >= required:
-                        kept.append(item)
-                items = kept
-            counts["after_empty_box"] = len(items)
+            cache_key = self._pre_nms_settings_key(settings)
+            cache_hit = cache_key == self._pre_nms_cache_key
+            if cache_hit:
+                items = list(self._pre_nms_cache_items)
+                counts = dict(self._pre_nms_cache_counts)
+            else:
+                items, counts = self._filter_before_nms(settings)
+                self._pre_nms_cache_key = cache_key
+                self._pre_nms_cache_items = list(items)
+                self._pre_nms_cache_counts = dict(counts)
 
             nms_settings = settings["nms"]
             if nms_settings["enabled"]:
@@ -1156,9 +1326,12 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
 
             self.filtered = items
             self.last_filter_counts = counts
+            self.last_filter_used_pre_nms_cache = cache_hit
             self.current_index = 0
             self.refresh_visible()
-            self._set_status("필터 적용 완료")
+            self._set_status(
+                "NMS만 재적용 완료" if cache_hit else "전체 필터 적용 완료"
+            )
         except Exception as exc:
             self._set_status(f"필터 실패: {exc}")
             QtWidgets.QMessageBox.critical(self, "Filter failed", str(exc))
@@ -1197,6 +1370,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             f"{stage_text}\n"
             f"최종 필터 {len(self.filtered)}   ·   표시 {len(self.visible)}   ·   "
             f"승인 {decisions['accept']}   ·   제외 {decisions['reject']}   ·   미검수 {decisions['']}"
+            + ("   ·   NMS만 재계산" if self.last_filter_used_pre_nms_cache else "")
         )
 
     # ---------------------------------------------------------------- review
@@ -1556,6 +1730,381 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
         suffix = "" if not label else f"_{label}"
         return self._dataset_path() / f"{self.object_name}_grasp_review{suffix}.json"
 
+    def _isaac_replay_manifest_path(self) -> Path:
+        grasp_dir = self._grasp_dir_name()
+        label = grasp_dir.removeprefix("output_grasp").strip("_")
+        suffix = "" if not label else f"_{label}"
+        return (
+            self._dataset_path()
+            / f"{self.object_name}_filtered_replay_manifest{suffix}.json"
+        )
+
+    def _isaac_review_result_path(self) -> Path:
+        manifest = self._isaac_replay_manifest_path()
+        return manifest.with_name(f"{manifest.stem}_review.json")
+
+    def _selected_filtered_items(self) -> list[dict]:
+        """Return the exact set that would be merged, before schema compaction."""
+        result = []
+        for item in self.filtered:
+            decision = self.decisions.get(review_id(item), "")
+            if decision == "reject":
+                continue
+            if self.accepted_only_save_check.isChecked() and decision != "accept":
+                continue
+            result.append(item)
+        key = str(self.sort_combo.currentData())
+        reverse = bool(self.sort_descending_check.isChecked())
+        if key == "scene_id":
+            result.sort(
+                key=lambda item: str(item.get("scene_id", "")), reverse=reverse
+            )
+        else:
+            result.sort(key=lambda item: finite_score(item, key), reverse=reverse)
+        return result
+
+    def save_isaac_replay_manifest(
+        self, *, show_confirmation: bool = True
+    ) -> Path | None:
+        """Export the current filter result for replay_filtered_grasps.py."""
+        if self.reference_object is None:
+            QtWidgets.QMessageBox.warning(self, "No data", "먼저 데이터를 불러오세요.")
+            return None
+        try:
+            entries = []
+            source_cache: dict[str, tuple[dict, list[dict], list[dict]]] = {}
+            for item in self._selected_filtered_items():
+                identifier = review_id(item)
+                try:
+                    output_index = int(identifier.rsplit(":", 1)[1])
+                except (IndexError, ValueError) as exc:
+                    raise ValueError(f"잘못된 review id: {identifier}") from exc
+                scene_id = str(item.get("scene_id", ""))
+                if scene_id not in source_cache:
+                    dataset = self._dataset_path()
+                    scene_conf = load_json(dataset / "conf" / f"{scene_id}.json")
+                    output_items = normalize_grasp_payload(
+                        load_json(
+                            dataset
+                            / self._grasp_dir_name()
+                            / f"{scene_id}.json"
+                        )
+                    )
+                    pregrasp_payload = load_json(
+                        dataset / "pre_grasp" / f"{scene_id}.json"
+                    )
+                    if isinstance(pregrasp_payload, dict):
+                        pregrasp_groups = [pregrasp_payload]
+                    elif isinstance(pregrasp_payload, list):
+                        pregrasp_groups = pregrasp_payload
+                    else:
+                        raise ValueError(
+                            f"scene {scene_id}: 잘못된 pre_grasp 형식"
+                        )
+                    if len(pregrasp_groups) != 1 or not isinstance(
+                        pregrasp_groups[0].get("data"), list
+                    ):
+                        raise ValueError(
+                            f"scene {scene_id}: pre_grasp group이 하나가 아닙니다"
+                        )
+                    source_cache[scene_id] = (
+                        scene_conf,
+                        output_items,
+                        pregrasp_groups[0]["data"],
+                    )
+                scene_conf, output_items, pregrasps = source_cache[scene_id]
+                if not 0 <= output_index < len(output_items):
+                    raise IndexError(
+                        f"{identifier}: output index가 0..{len(output_items) - 1} 범위밖입니다"
+                    )
+                raw_grasp = copy.deepcopy(output_items[output_index])
+                source_pregrasp_index = int(
+                    raw_grasp.get("source_pregrasp_index", -1)
+                )
+                if not 0 <= source_pregrasp_index < len(pregrasps):
+                    raise IndexError(
+                        f"{identifier}: source_pregrasp_index="
+                        f"{source_pregrasp_index}, count={len(pregrasps)}"
+                    )
+                entries.append(
+                    {
+                        "review_id": identifier,
+                        "source": {
+                            "scene_id": scene_id,
+                            "output_index": output_index,
+                            "source_pregrasp_index": source_pregrasp_index,
+                        },
+                        "grasp": raw_grasp,
+                        "pregrasp": copy.deepcopy(
+                            pregrasps[source_pregrasp_index]
+                        ),
+                    }
+                )
+
+            if not entries:
+                raise ValueError(
+                    "현재 필터/검수 조건으로 재현할 grasp가 없습니다"
+                )
+
+            first_source = self.candidates[0] if self.candidates else {}
+            metadata = {
+                "schema": "single_object_filtered_replay_manifest",
+                "schema_version": 2,
+                "coordinate_frame": "source_scene_world_per_entry",
+                "dataset_path": str(self._dataset_path()),
+                "dataset_root": str(
+                    Path(self.root_edit.text()).expanduser().resolve()
+                ),
+                "object_directory": self.object_combo.currentText(),
+                "gripper_directory": self.gripper_combo.currentText(),
+                "grasp_directory": self._grasp_dir_name(),
+                "object": self.object_name,
+                "gripper_model": first_source.get(
+                    "gripper_model", self.gripper_combo.currentText()
+                ),
+                "gripper_type": first_source.get("gripper_type", ""),
+                "filters": self._filter_settings(),
+                "accepted_only": self.accepted_only_save_check.isChecked(),
+                "count": len(entries),
+            }
+            path = self._isaac_replay_manifest_path()
+            scenes = {
+                scene_id: copy.deepcopy(cached[0])
+                for scene_id, cached in source_cache.items()
+            }
+            atomic_json(
+                path,
+                {"metadata": metadata, "scenes": scenes, "data": entries},
+            )
+            self._set_status(f"Isaac 검수 목록: {len(entries)}개\n{path}")
+            if show_confirmation:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Isaac replay manifest saved",
+                    f"{len(entries)}개를 저장했습니다.\n\n{path}",
+                )
+            return path
+        except Exception as exc:
+            self._set_status(f"Isaac 검수 목록 저장 실패: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Manifest save failed", str(exc))
+            return None
+
+    @staticmethod
+    def _replay_script_path() -> Path:
+        return Path(__file__).resolve().with_name("replay_filtered_grasps.py")
+
+    def _running_replay_pids(self) -> list[int]:
+        """Find only this user's replay_filtered_grasps.py processes."""
+        replay_script = str(self._replay_script_path())
+        result = set()
+        tracked = self.isaac_replay_process
+        if tracked is not None and tracked.poll() is None:
+            result.add(int(tracked.pid))
+
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            return sorted(result)
+        current_pid = os.getpid()
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        for process_dir in proc_root.iterdir():
+            if not process_dir.name.isdigit():
+                continue
+            pid = int(process_dir.name)
+            if pid == current_pid:
+                continue
+            try:
+                if current_uid is not None and process_dir.stat().st_uid != current_uid:
+                    continue
+                arguments = (
+                    (process_dir / "cmdline")
+                    .read_bytes()
+                    .decode("utf-8", errors="replace")
+                    .split("\0")
+                )
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            for argument in arguments:
+                if not argument:
+                    continue
+                try:
+                    argument_path = str(Path(argument).expanduser().resolve())
+                except (OSError, RuntimeError):
+                    continue
+                if argument_path == replay_script:
+                    result.add(pid)
+                    break
+        return sorted(result)
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        try:
+            os.kill(int(pid), 0)
+            # A terminated Popen child remains in /proc as a zombie until it
+            # is polled/reaped. Treat it as stopped instead of waiting 4 s.
+            stat_fields = Path(f"/proc/{int(pid)}/stat").read_text().split()
+            if len(stat_fields) >= 3 and stat_fields[2] == "Z":
+                return False
+            return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            return False
+
+    def stop_isaac_replay(self, *, quiet: bool = False) -> bool:
+        """Close every replay process for this script, including orphaned ones."""
+        pids = self._running_replay_pids()
+        if not pids:
+            self.isaac_replay_process = None
+            if not quiet:
+                self._set_status("실행 중인 grasp replay가 없습니다.")
+            return True
+
+        self._set_status(
+            "기존 grasp replay를 종료하는 중...\n"
+            + ", ".join(f"PID {pid}" for pid in pids)
+        )
+        for pid in pids:
+            try:
+                process_group = os.getpgid(pid)
+                if process_group == pid:
+                    os.killpg(process_group, signal.SIGTERM)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        deadline = time.monotonic() + 4.0
+        remaining = list(pids)
+        while remaining and time.monotonic() < deadline:
+            QtWidgets.QApplication.processEvents(
+                QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+            )
+            time.sleep(0.05)
+            remaining = [pid for pid in remaining if self._pid_is_alive(pid)]
+
+        for pid in remaining:
+            try:
+                process_group = os.getpgid(pid)
+                if process_group == pid:
+                    os.killpg(process_group, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        tracked = self.isaac_replay_process
+        if tracked is not None:
+            try:
+                tracked.wait(timeout=0.2)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                pass
+        self.isaac_replay_process = None
+        if not quiet:
+            self._set_status("grasp replay 종료 완료")
+        return True
+
+    def start_isaac_replay(self) -> None:
+        """Replace any running replay with the current filtered result."""
+        # Object, gripper, and filter changes must replace the simulator data.
+        # Stop first so PhysX/GPU resources are released before relaunch.
+        self.stop_isaac_replay(quiet=True)
+
+        requested_signature = self._dataset_load_signature()
+        if requested_signature != self.loaded_dataset_signature:
+            if not self.load_dataset():
+                return
+            if self.loaded_dataset_signature != requested_signature:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Replay launch failed",
+                    "현재 물체/그리퍼 데이터를 새로 불러오지 못했습니다.",
+                )
+                return
+        else:
+            # The source data is current, but score/empty/NMS controls may
+            # have changed since the user last pressed "필터 적용".
+            self.apply_filters()
+
+        manifest_path = self.save_isaac_replay_manifest(
+            show_confirmation=False
+        )
+        if manifest_path is None:
+            return
+
+        replay_script = self._replay_script_path()
+        if not replay_script.is_file():
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Replay launch failed",
+                f"replay script가 없습니다:\n{replay_script}",
+            )
+            return
+
+        child_environment = os.environ.copy()
+        # Pass the exact file produced by this button. This avoids depending on
+        # a hard-coded dataset or on whichever manifest happens to be newest.
+        child_environment["ISAAC_REPLAY_MANIFEST"] = str(manifest_path)
+        try:
+            self.isaac_replay_process = subprocess.Popen(
+                [sys.executable, str(replay_script)],
+                cwd=str(replay_script.parent),
+                env=child_environment,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.isaac_replay_process = None
+            self._set_status(f"Replay 실행 실패: {exc}")
+            QtWidgets.QMessageBox.critical(
+                self, "Replay launch failed", str(exc)
+            )
+            return
+
+        self._set_status(
+            "필터 결과 replay 실행 중\n"
+            f"PID {self.isaac_replay_process.pid}\n{manifest_path}"
+        )
+
+    def load_isaac_review_result(self) -> None:
+        default = self._isaac_review_result_path()
+        if default.is_file():
+            selected = str(default)
+        else:
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Isaac 검수 결과 불러오기",
+                str(default),
+                "JSON (*.json)",
+            )
+        if not selected:
+            return
+        try:
+            payload = load_json(Path(selected))
+            metadata = payload.get("metadata", {})
+            if metadata.get("schema") != "single_object_filtered_replay_review":
+                raise ValueError("Isaac 검수 결과 JSON이 아닙니다")
+            saved_dataset = Path(metadata.get("dataset_path", "")).expanduser().resolve()
+            if saved_dataset != self._dataset_path():
+                raise ValueError(
+                    "검수 결과의 dataset이 현재 선택과 다릅니다.\n"
+                    f"saved: {saved_dataset}\ncurrent: {self._dataset_path()}"
+                )
+            if str(metadata.get("grasp_directory", "")) != self._grasp_dir_name():
+                raise ValueError("검수 결과의 grasp 폴더가 현재 선택과 다릅니다")
+            decisions = payload.get("decisions", {})
+            if not isinstance(decisions, dict):
+                raise ValueError("decisions가 dict가 아닙니다")
+            valid_ids = {review_id(item) for item in self.candidates}
+            imported = {
+                str(key): str(value)
+                for key, value in decisions.items()
+                if str(key) in valid_ids and value in ("accept", "reject")
+            }
+            self.decisions.update(imported)
+            self.refresh_visible()
+            self._set_status(
+                f"Isaac 검수 결과: {len(imported)}개 반영\n{selected}"
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Isaac review load failed", str(exc))
+
     def save_review_state(self) -> None:
         try:
             path = self._review_state_path()
@@ -1663,21 +2212,10 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             )
 
     def final_items(self) -> list[dict]:
-        result = []
-        for item in self.filtered:
-            decision = self.decisions.get(review_id(item), "")
-            if decision == "reject":
-                continue
-            if self.accepted_only_save_check.isChecked() and decision != "accept":
-                continue
-            result.append(clean_item(item))
-        key = str(self.sort_combo.currentData())
-        reverse = bool(self.sort_descending_check.isChecked())
-        if key == "scene_id":
-            result.sort(key=lambda item: str(item.get("scene_id", "")), reverse=reverse)
-        else:
-            result.sort(key=lambda item: finite_score(item, key), reverse=reverse)
-        return result
+        return [
+            compact_merged_item(clean_item(item))
+            for item in self._selected_filtered_items()
+        ]
 
     def save_final(self) -> None:
         if self.reference_object is None:
@@ -1701,31 +2239,31 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             if json_path.suffix.lower() != ".json":
                 json_path = json_path.with_suffix(".json")
             npz_path = json_path.with_suffix(".npz")
-            decisions = Counter(self.decisions.get(review_id(item), "") for item in self.filtered)
+            first_source = self.candidates[0] if self.candidates else {}
             metadata = {
+                "schema": "single_object_grasp_compact",
+                "schema_version": 2,
+                "coordinate_frame": "object_zero_pose",
                 "object": self.object_name,
-                "dataset_root": str(Path(self.root_edit.text()).expanduser().resolve()),
-                "object_directory": self.object_combo.currentText(),
-                "gripper_directory": self.gripper_combo.currentText(),
-                "gripper_root": str(self._dataset_path()),
-                "source_grasp_directory": self._grasp_dir_name(),
-                "scene_ids": self.scene_ids,
-                "approach_axis_index": 2,
-                "approach_axis_sign": 1.0,
+                "gripper_model": first_source.get(
+                    "gripper_model", self.gripper_combo.currentText()
+                ),
+                "gripper_type": first_source.get("gripper_type", ""),
+                "source": {
+                    "dataset_root": str(
+                        Path(self.root_edit.text()).expanduser().resolve()
+                    ),
+                    "object_directory": self.object_combo.currentText(),
+                    "gripper_directory": self.gripper_combo.currentText(),
+                    "grasp_directory": self._grasp_dir_name(),
+                },
                 "object_config_zero_pose": zero_pose_object_config(
                     self.reference_object
                 ),
-                "replay_schema_version": 1,
-                "filters": self._filter_settings(),
-                "manual_review": {
-                    "accepted": decisions["accept"],
-                    "rejected": decisions["reject"],
-                    "accepted_only_save": bool(self.accepted_only_save_check.isChecked()),
-                },
-                "counts": {**self.last_filter_counts, "final": len(items)},
+                "count": len(items),
             }
             atomic_json(json_path, {"metadata": metadata, "data": items})
-            save_npz(npz_path, metadata, items)
+            save_compact_npz(npz_path, metadata, items)
             self.save_review_state()
             self._set_status(f"최종 저장: {len(items)}개\n{json_path}\n{npz_path}")
             QtWidgets.QMessageBox.information(
@@ -1738,6 +2276,7 @@ class GraspFilterGUI(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.stop_isaac_replay(quiet=True)
         if self.visualizer is not None:
             try:
                 self.visualizer.destroy_window()

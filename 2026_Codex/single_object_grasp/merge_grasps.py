@@ -153,6 +153,51 @@ def transform_pose_dict(pose: dict, inverse: np.ndarray) -> dict:
     return result
 
 
+def restore_hand_preset_base_tf(item: dict) -> dict:
+    """Repair legacy hand records whose geometry, but not preset TF, was restored.
+
+    ``grasp_complete_restored`` already left-multiplies the hand BBoxes and
+    grasp descriptor by ``object_motion_restore_mat``.  Older records copied
+    ``target_base_tf`` directly from the pregrasp, so replay followed a
+    different path.  New records carry an explicit marker and pass through.
+    """
+    result = copy.deepcopy(item)
+    if str(result.get("gripper_type", "")).strip().lower() != "hand":
+        return result
+
+    quality = result.get("quality")
+    if not isinstance(quality, dict):
+        return result
+    if str(quality.get("grasp_record_mode", "")).strip().lower() != (
+        "grasp_complete_restored"
+    ):
+        return result
+    if bool(quality.get("hand_preset_base_tf_restored", False)):
+        return result
+
+    restore = np.asarray(quality.get("object_motion_restore_mat", []), dtype=np.float64)
+    if restore.shape != (4, 4) or not np.all(np.isfinite(restore)):
+        raise ValueError(
+            "Legacy restored hand grasp is missing a valid "
+            "quality.object_motion_restore_mat"
+        )
+    target_base = result.get("target_base_tf")
+    if not isinstance(target_base, dict) or not all(
+        isinstance(target_base.get(phase), dict)
+        and "position" in target_base[phase]
+        and "orientation_wxyz" in target_base[phase]
+        for phase in ("start", "end")
+    ):
+        raise ValueError("Restored hand grasp is missing target_base_tf.start/end")
+
+    result["target_base_tf"] = {
+        phase: transform_pose_dict(target_base[phase], restore)
+        for phase in ("start", "end")
+    }
+    result["quality"]["hand_preset_base_tf_restored"] = True
+    return result
+
+
 def pregrasp_to_zero_pose(pregrasp: dict, obj_conf: dict) -> dict:
     """Convert the exact replay input from scene/world space to object space."""
     inverse = np.linalg.inv(object_pose_matrix(obj_conf))
@@ -196,6 +241,9 @@ def zero_pose_object_config(obj_conf: dict) -> dict:
 
 
 def to_zero_pose(item: dict, obj_conf: dict, scene_id: str) -> dict | None:
+    # This is also the compatibility migration path for output_grasp files
+    # collected before hand preset base TFs were restored with their BBoxes.
+    item = restore_hand_preset_base_tf(item)
     box = np.asarray(item.get("grasp_box", []), dtype=np.float64)
     if box.shape != (4, 3):
         return None

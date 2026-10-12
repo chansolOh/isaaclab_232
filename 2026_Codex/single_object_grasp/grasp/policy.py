@@ -1108,6 +1108,41 @@ class GraspPolicy:
         return quaternion if quaternion[0] >= 0.0 else -quaternion
 
     @staticmethod
+    def _quaternion_to_matrix_np(quaternion: np.ndarray) -> np.ndarray:
+        """Convert a WXYZ quaternion to a 3x3 rotation matrix."""
+        quaternion = np.asarray(quaternion, dtype=np.float64)
+        if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+            raise ValueError("orientation_wxyz must be a finite length-4 quaternion")
+        quaternion /= max(float(np.linalg.norm(quaternion)), 1.0e-12)
+        w, x, y, z = quaternion
+        return np.asarray(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+
+    def _transform_pose_dict_np(self, transform: np.ndarray, pose: dict) -> dict:
+        """Left-multiply a world-frame pose by ``transform``."""
+        pose_matrix = np.eye(4, dtype=np.float64)
+        pose_matrix[:3, :3] = self._quaternion_to_matrix_np(
+            pose["orientation_wxyz"]
+        )
+        pose_matrix[:3, 3] = np.asarray(pose["position"], dtype=np.float64)
+        transformed = np.asarray(transform, dtype=np.float64) @ pose_matrix
+        result = copy.deepcopy(pose)
+        result["position"] = transformed[:3, 3].round(7).tolist()
+        result["orientation_wxyz"] = self._matrix_to_quaternion_np(
+            transformed[:3, :3]
+        ).round(8).tolist()
+        result["rpy_deg"] = self._matrix_to_euler_xyz_deg_np(
+            transformed[:3, :3]
+        ).round(7).tolist()
+        return result
+
+    @staticmethod
     def _matrix_to_euler_xyz_deg_np(rotation: np.ndarray) -> np.ndarray:
         """Return XYZ Euler angles for R = Rz(yaw) Ry(pitch) Rx(roll)."""
         rotation = np.asarray(rotation, dtype=np.float64)
@@ -1335,6 +1370,15 @@ class GraspPolicy:
             restored_matrix = self._hand_descriptor_matrix(
                 restored_matrix, restored_boxes, restored_approach
             )
+            # The hand BBoxes and descriptor are restored into the object's
+            # initial pose above.  Restore the saved START/END hand-base path
+            # with the exact same rigid transform so replay follows those
+            # BBoxes, just as a finger grasp uses its restored robot pose.
+            target_base_tf = source["target_base_tf"]
+            restored_target_base_tf = {
+                phase: self._transform_pose_dict_np(restore, target_base_tf[phase])
+                for phase in ("start", "end")
+            }
         restored_force = restore[:3, :3] @ force_direction
         restored_force /= max(float(np.linalg.norm(restored_force)), 1.0e-12)
         geometry = {
@@ -1351,6 +1395,8 @@ class GraspPolicy:
             "bbox_contact_mean_z": bbox_contact_mean_z,
         }
         geometry.update(self._orientation_fields(restored_matrix))
+        if self.is_hand:
+            geometry["target_base_tf"] = restored_target_base_tf
         return geometry
 
     def _minimum_separation_value(self, env_id: int) -> float | None:
@@ -1511,6 +1557,10 @@ class GraspPolicy:
                     "result": result,
                     "test_sequence": "close_then_stress",
                     "grasp_record_mode": self.grasp_record_mode,
+                    "hand_preset_base_tf_restored": bool(
+                        self.is_hand
+                        and self.grasp_record_mode == "grasp_complete_restored"
+                    ),
                     "grasp_complete_width_m": round(
                         float(self.grasp_complete_width[env_id]), 7
                     ) if not self.is_hand else None,
@@ -1617,7 +1667,9 @@ class GraspPolicy:
                 "transition", "selected_heightmap_yaw", "first_contact_z",
                 "safety_margin", "grasp_bbox_sets", "contact_sensor_sets",
             ):
-                if key in source:
+                if key == "target_base_tf" and key in geometry:
+                    record[key] = copy.deepcopy(geometry[key])
+                elif key in source:
                     record[key] = copy.deepcopy(source[key])
             # output_grasp is a success dataset. Failed stress attempts belong
             # only in attempt_history and must not become low-score grasps.

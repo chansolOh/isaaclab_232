@@ -1,11 +1,18 @@
-"""Argument wrapper for hand grasp collection with robot-platform collision filtering."""
+"""Argument wrapper for grasp collection and output-grasp verification."""
 
 import argparse
 import os
 import sys
 
 
-parser = argparse.ArgumentParser(description="Grasp Generator (finger + hand)")
+parser = argparse.ArgumentParser(description="Grasp Generator / Verifier (finger + hand)")
+parser.add_argument(
+    "command",
+    nargs="?",
+    default="grasp",
+    choices=("grasp", "grasp_verif"),
+    help="grasp: collect from pre_grasp; grasp_verif: verify output_grasp on CPU",
+)
 parser.add_argument(
     "--root_path",
     default="/nas/Dataset/Dataset_2026/dataset_v2",
@@ -27,9 +34,9 @@ root_path = os.path.join(
 # Isaac Lab's launcher owns the remaining CLI parsing, matching Grasp_arg.py.
 sys.argv = [sys.argv[0]]
  
-import Direct_RL_main_new_filter as DRm
+if args.command == "grasp_verif":
+    import Verify_Output_Grasp_CPU as runner
+else:
+    import Direct_RL_main_new_filter as runner
 
-DRm.main(
-    root_path=root_path,
-    scene_num=args.scene_start,
-)
+runner.main(root_path=root_path, scene_num=args.scene_start)

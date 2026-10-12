@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.dataset_v2_cache/
 
 # Virtual environments
 .venv

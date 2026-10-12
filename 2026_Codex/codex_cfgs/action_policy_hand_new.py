@@ -534,16 +534,22 @@ class HandActionPolicy:
             target_class.append(class_name_idx[target_object])
             target_points.append(record["target_points"])
             if "grasp_bbox" not in record:
-                raise KeyError(
-                    "Hand pre-grasp is missing grasp_bbox. "
-                    "Regenerate pre_grasp with Collect_Hand_PreGrasp_dataset.py."
-                )
-            bbox = np.asarray(record["grasp_bbox"], dtype=np.float64)
-            if bbox.ndim != 3 or bbox.shape[1:] != (4, 3):
-                raise ValueError(
-                    f"Invalid hand pre-grasp grasp_bbox shape: {bbox.shape}. "
-                    "Expected (bbox_count, 4, 3)."
-                )
+                if "_verification_id" not in record:
+                    raise KeyError(
+                        "Hand pre-grasp is missing grasp_bbox. "
+                        "Regenerate pre_grasp with Collect_Hand_PreGrasp_dataset.py."
+                    )
+                # BBoxes are candidate-generation/debug geometry, not physics
+                # input.  output_grasp verification replays the saved base TF
+                # and joint endpoints and therefore intentionally has none.
+                bbox = np.empty((0, 4, 3), dtype=np.float64)
+            else:
+                bbox = np.asarray(record["grasp_bbox"], dtype=np.float64)
+                if bbox.ndim != 3 or bbox.shape[1:] != (4, 3):
+                    raise ValueError(
+                        f"Invalid hand pre-grasp grasp_bbox shape: {bbox.shape}. "
+                        "Expected (bbox_count, 4, 3)."
+                    )
             grasp_bbox.append(bbox.tolist())
 
         def tensor(values, *, dtype=torch.float):
@@ -929,10 +935,7 @@ class HandActionPolicy:
             env_id = int(env_ids[local_index])
             source_id = int(self.assigned_pregrasp[env_id])
             source = self.pre_grasp_data[source_id]
-            bbox_3d = np.asarray(source["grasp_bbox"], dtype=np.float64)
-            bbox_2d = self._bbox_3d_to_2d_np(bbox_3d)
             record = {
-                "bbox_2d": self._bbox_2d_summary(bbox_2d),
                 "target_points": copy.deepcopy(source["target_points"]),
                 "target_orientation": copy.deepcopy(source["target_orientation"]),
                 "target_width": 0.0,
@@ -946,6 +949,12 @@ class HandActionPolicy:
                 "transition": copy.deepcopy(source.get("transition", {})),
                 "disturbed_object_count": int(disturbed_counts[local_index]),
             }
+            if "grasp_bbox" in source:
+                bbox_3d = np.asarray(source["grasp_bbox"], dtype=np.float64)
+                bbox_2d = self._bbox_3d_to_2d_np(bbox_3d)
+                record["bbox_2d"] = self._bbox_2d_summary(bbox_2d)
+            if "_verification_id" in source:
+                record["_verification_id"] = int(source["_verification_id"])
             for optional_key in (
                 "selected_heightmap_yaw",
                 "first_contact_z",

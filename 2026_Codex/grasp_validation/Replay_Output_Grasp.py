@@ -35,6 +35,20 @@ if str(LEGACY_CHANSOL_DIR) not in sys.path:
     sys.path.append(str(LEGACY_CHANSOL_DIR))
 
 
+def require_isaac_compatible_numpy() -> None:
+    """Fail before Kit startup instead of mixing NumPy 2 with Kit NumPy 1.x."""
+    try:
+        major = int(str(np.__version__).split(".", 1)[0])
+    except (TypeError, ValueError):
+        major = 0
+    if major >= 2:
+        raise RuntimeError(
+            "Isaac Lab 2.3.2 requires NumPy < 2, but Replay was started with "
+            f"NumPy {np.__version__} from {np.__file__}. Run `uv sync` in "
+            f"{Path(__file__).resolve().parents[2]} before using Load to Sim."
+        )
+
+
 def load_json(path: Path):
     with path.open("r", encoding="utf-8") as stream:
         return json.load(stream)
@@ -278,6 +292,7 @@ def parse_control(path: Path, previous_request_id: int) -> dict | None:
 
 
 def main() -> None:
+    require_isaac_compatible_numpy()
     parser = argparse.ArgumentParser(description="Replay one output_grasp record in Isaac Lab")
     parser.add_argument("--root_path", required=True)
     parser.add_argument("--scene_num", required=True, type=int)

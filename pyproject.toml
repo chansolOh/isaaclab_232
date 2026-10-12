@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "customtkinter>=6.0.0",
+    "isaaclab[isaacsim]==2.3.2.post1",
+    "numpy==1.26.0",
     "open3d>=0.19.0",
     "packaging==23.0",
     "pyside6>=6.11.2",
@@ -13,3 +15,9 @@ dependencies = [
 ]
 [tool.uv.extra-build-dependencies]
 flatdict = ["setuptools<82"]
+
+# Isaac Sim 5.1.0.0 publishes ``isaacsim-core`` with an unconditional
+# ``pywin32`` dependency.  pywin32 has no Linux distribution, so constrain
+# that vendor dependency to the platform on which it is actually usable.
+[tool.uv]
+override-dependencies = ["pywin32==306; sys_platform == 'win32'"]

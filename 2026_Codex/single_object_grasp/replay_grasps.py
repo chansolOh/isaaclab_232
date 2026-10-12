@@ -15,10 +15,10 @@ from isaaclab.app import AppLauncher
 # -----------------------------------------------------------------------------
 ROOT = Path(
     "/nas/Dataset/Dataset_2026/isaacsim_grasp_data_gen/"
-    "black_pepper_shaker/"
-    "UON_3finger_gripper"#"UON_3finger_gripper"
+    "lint_roller/"
+    "Inspire-F1_right"#"UON_3finger_gripper"
 )
-SCENE = 0
+SCENE = 2
 # collect_grasps.py의 GRASP_RECORD_MODE에 맞춰 선택한다.
 GRASP_DIR_NAME = "output_grasp"
 

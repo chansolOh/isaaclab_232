@@ -816,8 +816,7 @@ class FingerActionPolicy:
                 base_rpy_deg[0] += 180.0
                 start_joint = self.executed_start_joint[env_id].detach().cpu().tolist()
                 end_joint = self.executed_end_joint[env_id].detach().cpu().tolist()
-                self.output_list.append(
-                    {
+                record = {
                         "bbox_2d": self._bbox_summary(
                             bbox_2d, -math.radians(float(source["target_orientation"][2]))
                         ),
@@ -858,7 +857,12 @@ class FingerActionPolicy:
                         "joint_unit": "rad",
                         "disturbed_object_count": int(disturbed[success_rows[output_index]]),
                     }
-                )
+                # Used only by the output-grasp verifier to associate a policy
+                # result with its source record.  Normal collection records do
+                # not contain this private field.
+                if "_verification_id" in source:
+                    record["_verification_id"] = int(source["_verification_id"])
+                self.output_list.append(record)
 
         failed_envs = env_ids[~success]
         if len(failed_envs):

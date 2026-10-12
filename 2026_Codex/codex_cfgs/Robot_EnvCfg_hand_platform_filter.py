@@ -377,11 +377,11 @@ class RobotEnv(DirectRLEnv):
         root_state = self.platform.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
         root_state[:, 2] += offsets
-        velocity = torch.zeros_like(root_state[:, 7:])
-        # The platform is teleported out of the way. Keep its velocity zero so
-        # the 50 cm jump does not inject a large downward impulse into objects.
+        # This platform is kinematic.  Its pose may be written directly, but
+        # PhysX rejects the dynamic-body velocity API for kinematic bodies
+        # (especially on the CPU backend).  A kinematic target does not need a
+        # separate zero-velocity write.
         self.platform.write_root_pose_to_sim(root_state[:, :7], env_ids)
-        self.platform.write_root_velocity_to_sim(velocity, env_ids)
         self._last_platform_drop_offset[env_ids] = offsets
 
     def _apply_passive_joint_effort_limit(self) -> None:
