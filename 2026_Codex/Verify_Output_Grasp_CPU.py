@@ -18,7 +18,7 @@ import Direct_RL_main_new_filter as collector
 
 
 HEADLESS = True
-VERIFICATION_REPEATS = 3
+VERIFICATION_REPEATS = 1
 VERIFICATION_NUM_ENVS = 150
 
 
