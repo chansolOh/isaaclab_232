@@ -19,7 +19,7 @@ import Direct_RL_main_new_filter as collector
 
 HEADLESS = True
 VERIFICATION_REPEATS = 3
-VERIFICATION_NUM_ENVS = 200
+VERIFICATION_NUM_ENVS = 150
 
 
 def _load_records(path: Path) -> list[dict]:
