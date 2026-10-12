@@ -374,6 +374,10 @@ class RobotEnv(DirectRLEnv):
             return
 
         offsets = self.act_pol.platform_drop_offset[env_ids]
+        previous_offsets = self._last_platform_drop_offset[env_ids]
+        changed_env_ids = env_ids[
+            ~torch.isclose(offsets, previous_offsets, rtol=0.0, atol=1.0e-8)
+        ]
         root_state = self.platform.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
         root_state[:, 2] += offsets
@@ -383,6 +387,25 @@ class RobotEnv(DirectRLEnv):
         # separate zero-velocity write.
         self.platform.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._last_platform_drop_offset[env_ids] = offsets
+
+        if len(changed_env_ids):
+            self._wake_scene_objects(changed_env_ids)
+
+    def _wake_scene_objects(self, env_ids: torch.Tensor) -> None:
+        """Wake dynamic objects when their kinematic support moves away.
+
+        CPU PhysX does not necessarily wake a sleeping rigid body when the
+        contact underneath it disappears.  Without this explicit wake-up,
+        objects can remain suspended at their old platform height until an
+        interactive mouse impulse wakes them.
+        """
+        if len(env_ids) == 0:
+            return
+        for index in range(10):
+            rigid_object = getattr(self, f"obj{index:02d}", None)
+            if rigid_object is None:
+                continue
+            rigid_object.root_physx_view.wake_up(env_ids)
 
     def _apply_passive_joint_effort_limit(self) -> None:
         if self.cfg.passive_effort_limit is None:
